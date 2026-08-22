@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Runtime data & logs (created at runtime)
+data/
+logs/
+
+# Local credentials / scrip cache
+scrip_master.json
+settings.json
+*.log
+
+# CSV output (trade / order / scan ledgers)
+*.csv
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
