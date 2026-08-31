@@ -16,7 +16,7 @@ Flat by 09:30 every day.
 | 09:08:30 | Rank every F&O stock on the pre-open auction price against yesterday's close. Lock the ten names. |
 | 09:14:00 | Live feed connected and verified. |
 | 09:15:00 | Market opens. Each stock's opening price is recorded — this is the line. |
-| 09:15:15 / :30 | The early check. Anything already out and back is taken immediately. |
+| +0 / 15 / 30s | The early check. Anything already out and back is taken immediately. Configurable; 0 removes the warm-up entirely. |
 | 09:28:00 | Last entry. After this, setups are abandoned. |
 | 09:30:00 | Everything closed. Longs sold, shorts covered. |
 
@@ -87,6 +87,11 @@ machine from 09:15:00, but no order may be placed before the check moment.
 A stock that completed its out-and-back inside the first thirty seconds is
 therefore standing at an entry condition the instant the check arrives.
 
+The delay is a free numeric field, not a two-value dropdown. Setting it to
+0 removes the warm-up: entries fire from 09:15:00 onward, the moment a
+test-and-reclaim completes. That is a real change in behaviour rather than
+a faster version of the same thing — see the note on it below.
+
 **The stop.** Just the other side of the extreme reached during the test —
 one tick under the low for a long, one tick above the high for a short.
 Widened to a 0.25% floor if the test was very shallow. The trade is skipped
@@ -113,6 +118,19 @@ budget). This is faithful to the note, but it means the "ten percent of the
 account at risk in a fifteen-minute window" warning on page 8 overstates the
 real exposure by roughly five times. Worth resolving before Stage 3, because
 it changes what the settings review is actually measuring.
+
+**A zero-second check is not just a faster check.** With no warm-up, a
+test-and-reclaim can complete on three prints inside two seconds — a spread
+bounce on a gapping stock, not a move. The note allows for this at 15
+seconds ("will occasionally buy a stock that was only briefly under its
+opening price"); at 0 it stops being occasional. The consequence is not the
+individual trade but the daily cap: the first four signals take all four
+slots, and at 0 those four will systematically be the noisiest names rather
+than the cleanest, leaving nothing for a genuine setup at 09:18. If the
+setting is going to 0, raise `cross_buffer_pct` from 0.05 to roughly
+0.15-0.20 so "clearly through" still means something in the first seconds,
+and prove it in PAPER before LIVE. A warning is logged at startup whenever
+the value is 0.
 
 **Corporate actions are a manual input.** Angel exposes no ex-dividend or
 split calendar. Names to remove go in the exclusions box each morning. A

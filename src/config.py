@@ -44,7 +44,7 @@ STRATEGY = {
     "scan_time":        "09:08:30",   # rank the F&O list, lock the ten names
     "feed_time":        "09:14:00",   # connect + verify the live feed
     "open_time":        "09:15:00",   # market opens, record each opening price
-    "check_seconds":    30,           # early check: 15 or 30 sec after open
+    "check_seconds":    30,           # warm-up delay after the open; 0 = none
     "last_entry_time":  "09:28:00",   # after this, setups are abandoned
     "square_off_time":  "09:30:00",   # everything closed, no exceptions
 

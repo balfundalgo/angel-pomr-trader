@@ -201,8 +201,8 @@ class App(ctk.CTk):
         self.e_scan = self._field(tm, "Scan time", s["scan_time"], hint="09:08:30")
         self.e_feed = self._field(tm, "Feed connect", s["feed_time"])
         self.e_open = self._field(tm, "Market open", s["open_time"])
-        self.v_check = self._option(tm, "Early check", [15, 30],
-                                    s["check_seconds"], hint="seconds")
+        self.e_check = self._field(tm, "Early check", s["check_seconds"],
+                                   hint="seconds  ·  0 = act from the open")
         self.e_last = self._field(tm, "Last entry", s["last_entry_time"])
         self.e_sq = self._field(tm, "Square off", s["square_off_time"])
         ctk.CTkLabel(tm, text="", height=4).pack()
@@ -368,7 +368,12 @@ class App(ctk.CTk):
         s["scan_time"] = self.e_scan.get().strip()
         s["feed_time"] = self.e_feed.get().strip()
         s["open_time"] = self.e_open.get().strip()
-        s["check_seconds"] = int(self.v_check.get())
+        chk = int(float(self.e_check.get()))
+        if chk < 0:
+            raise ValueError("early check cannot be negative")
+        if chk > 780:   # 09:28 is 780s after the open
+            raise ValueError("early check falls after the last-entry time")
+        s["check_seconds"] = chk
         s["last_entry_time"] = self.e_last.get().strip()
         s["square_off_time"] = self.e_sq.get().strip()
 
@@ -417,6 +422,12 @@ class App(ctk.CTk):
         except ValueError as e:
             logger.error(f"Invalid input: {e}")
             return
+        if config.STRATEGY["check_seconds"] == 0:
+            logger.warning("Early check is 0 — there is no warm-up delay. "
+                           "Entries may fire on the first ticks after 09:15, "
+                           "when a test-and-reclaim can be spread noise "
+                           "rather than a real move. Watch the "
+                           "'clearly-through' buffer.")
         if config.TRADING_MODE == "LIVE":
             logger.warning("LIVE MODE — real orders will be sent.")
         config.save_settings()
