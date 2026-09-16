@@ -281,6 +281,122 @@ def t_one_entry_per_stock():
     check("a second setup on the same name is ignored", fired, None)
 
 
+def t_trail_off_by_default():
+    print("\n[13] The trail is off unless it is switched on")
+    config.STRATEGY["trail_enabled"] = False
+    st = mk("A", "GAINER", 100.0, 96.0)
+    st.set_open_price(100.0, "test")
+    st.state = S.ENTERED
+    st.entry_price, st.stop_price, st.initial_stop, st.qty = 100.0, 99.0, 99.0, 10
+    check("no move even on a large profit", st.trail_target(120.0), None)
+
+
+def t_trail_long():
+    print("\n[14] The ratchet on a long — X then Y/Z, from the entry price")
+    s = config.STRATEGY
+    s.update({"trail_enabled": True, "trail_trigger_pct": 10.0,
+              "trail_step_pct": 5.0, "trail_move_pct": 3.0,
+              "min_stop_pct": 0.25})
+    st = mk("A", "GAINER", 100.0, 96.0)
+    st.set_open_price(100.0, "test")
+    st.state = S.ENTERED
+    st.entry_price, st.stop_price, st.initial_stop, st.qty = 100.0, 99.0, 99.0, 10
+
+    check("below the trigger nothing moves", st.trail_target(109.0), None)
+
+    be = st.trail_target(110.0)
+    approx("at +X the stop goes to cost", be, 100.0)
+    st.apply_trail(be, 110.0)
+    check("breakeven is recorded", st.breakeven_done, True)
+    check("no step taken yet", st.trail_steps, 0)
+
+    a = st.trail_target(115.0)
+    approx("one further Y moves the stop one Z", a, 103.0)
+    st.apply_trail(a, 115.0)
+    b = st.trail_target(120.0)
+    approx("two Y moves it two Z", b, 106.0)
+    st.apply_trail(b, 120.0)
+    check("two steps recorded", st.trail_steps, 2)
+
+    check("a retrace never gives the step back", st.trail_target(117.0), None)
+    check("and the stop is still where it was", st.stop_price, 106.0)
+    check("the trade counts as trailed", st.trailed(), True)
+
+
+def t_trail_short_mirror():
+    print("\n[15] The ratchet on a short is the same shape, flipped")
+    s = config.STRATEGY
+    s.update({"trail_enabled": True, "trail_trigger_pct": 10.0,
+              "trail_step_pct": 5.0, "trail_move_pct": 3.0})
+    st = mk("B", "LOSER", 100.0, 104.0)
+    st.set_open_price(100.0, "test")
+    st.state = S.ENTERED
+    st.entry_price, st.stop_price, st.initial_stop, st.qty = 100.0, 101.0, 101.0, 10
+
+    check("below the trigger nothing moves", st.trail_target(91.0), None)
+    be = st.trail_target(90.0)
+    approx("at +X the stop goes to cost", be, 100.0)
+    st.apply_trail(be, 90.0)
+    a = st.trail_target(85.0)
+    approx("one step moves the stop DOWN, not up", a, 97.0)
+    st.apply_trail(a, 85.0)
+    approx("two steps", st.trail_target(80.0), 94.0)
+    check("a rally never loosens it", st.trail_target(88.0), None)
+
+
+def t_trail_clamp():
+    print("\n[16] A step bigger than the profit cannot walk the stop into price")
+    s = config.STRATEGY
+    # Z larger than Y: without the clamp the stop overtakes the market
+    s.update({"trail_enabled": True, "trail_trigger_pct": 10.0,
+              "trail_step_pct": 5.0, "trail_move_pct": 8.0,
+              "min_stop_pct": 0.25})
+    st = mk("C", "GAINER", 100.0, 96.0)
+    st.set_open_price(100.0, "test")
+    st.state = S.ENTERED
+    st.entry_price, st.stop_price, st.initial_stop, st.qty = 100.0, 99.0, 99.0, 10
+
+    st.apply_trail(st.trail_target(110.0), 110.0)
+    for px in (115.0, 120.0, 125.0, 130.0):
+        t = st.trail_target(px)
+        if t is not None:
+            st.apply_trail(t, px)
+        check(f"stop stays behind the market at {px:.0f}", st.stop_price < px)
+    approx("and sits a min-stop gap behind", st.stop_price, 130.0 - 0.25, 0.06)
+
+
+def t_trail_never_widens():
+    print("\n[17] The trail only ever tightens")
+    s = config.STRATEGY
+    s.update({"trail_enabled": True, "trail_trigger_pct": 10.0,
+              "trail_step_pct": 5.0, "trail_move_pct": 3.0})
+    st = mk("D", "GAINER", 100.0, 96.0)
+    st.set_open_price(100.0, "test")
+    st.state = S.ENTERED
+    # an unusually tight initial stop, already better than breakeven would be
+    st.entry_price, st.stop_price, st.initial_stop, st.qty = 100.0, 100.5, 100.5, 10
+    check("breakeven does not loosen a better stop", st.trail_target(110.0), None)
+    approx("stop untouched", st.stop_price, 100.5)
+
+
+def t_trail_exit_reason():
+    print("\n[18] A trail hit is logged distinctly from the original stop")
+    s = config.STRATEGY
+    s.update({"trail_enabled": True, "trail_trigger_pct": 10.0,
+              "trail_step_pct": 5.0, "trail_move_pct": 3.0})
+    st = mk("E", "GAINER", 100.0, 96.0)
+    st.set_open_price(100.0, "test")
+    st.state = S.ENTERED
+    st.entry_price, st.stop_price, st.initial_stop, st.qty = 100.0, 99.0, 99.0, 10
+    check("untrailed to start", st.trailed(), False)
+    check("original stop still breaches", st.stop_breached(98.9), True)
+    st.apply_trail(st.trail_target(115.0), 115.0)
+    check("now trailed", st.trailed(), True)
+    check("the old level no longer matters", st.stop_breached(102.0), True)
+    check("above the new stop is safe", st.stop_breached(104.0), False)
+    approx("best price tracked for the ledger", st.best_price, 115.0)
+
+
 def t_time_helpers():
     print("\n[12] The clock")
     config.STRATEGY["open_time"] = "09:15:00"
@@ -303,6 +419,8 @@ if __name__ == "__main__":
     for fn in (t_buffer, t_gainer_path, t_loser_mirror, t_never_tested,
                t_early_check, t_deep_test_disqualified, t_sizing, t_filters,
                t_short_list, t_stop_breach, t_one_entry_per_stock,
+               t_trail_off_by_default, t_trail_long, t_trail_short_mirror,
+               t_trail_clamp, t_trail_never_widens, t_trail_exit_reason,
                t_time_helpers):
         fn()
     print("\n" + "=" * 62)

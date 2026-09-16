@@ -102,7 +102,29 @@ percent of the account at risk, recalculated each morning from the live RMS
 balance. No position larger than a third of the account.
 
 **Exits.** Two, and no others: the stop is hit, or the clock reaches 09:30.
-No profit target, no trailing stop, no partial exits.
+No profit target, no partial exits.
+
+**The trail (optional, off by default).** A three-stage ratchet, all three
+values expressed as a percentage of the entry price so the behaviour is
+identical on a Rs 670 stock and a Rs 9,200 one:
+
+1. Profit reaches `trail_trigger_pct` -> the stop moves to the entry price.
+2. Every further `trail_step_pct` of profit -> the stop moves another
+   `trail_move_pct` in your favour, counted from the entry price.
+3. The stop only ever tightens. A retrace never gives back a step.
+
+Formally, once profit >= X: `steps = floor((profit - X) / Y)` and
+`stop = entry +/- steps * Z`. The result is held at least `min_stop_pct`
+behind the current price, so a Z larger than Y can never walk the stop
+through the market. The resting broker order is amended with `modifyOrder`
+rather than cancelled and replaced, because cancelling leaves the position
+naked for the round trip. An exit on a moved stop is logged as `TRAIL_HIT`
+rather than `STOP_HIT`, and the trade CSV gains `initial_stop`,
+`final_stop`, `trail_steps`, `best_price` and `best_excursion` so the trail
+can actually be measured afterwards.
+
+Option positions have no resting stop at the broker, so the trail there is
+engine-side only.
 
 ---
 

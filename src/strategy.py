@@ -86,6 +86,12 @@ class StockState:
     pnl: float = 0.0
     note: str = ""
 
+    # ---- the trail ----
+    trail_steps: int = 0           # how many Z-moves have been taken
+    breakeven_done: bool = False   # stop has reached the entry price
+    best_price: float = 0.0        # high-water mark in our favour
+    stop_sent: float = 0.0         # trigger last accepted by the broker
+
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
@@ -252,6 +258,106 @@ class StockState:
         return qty, stop, risk_taken, note
 
     # ------------------------------------------------------------------
+    # the trail
+    # ------------------------------------------------------------------
+    def open_profit(self, px: float) -> float:
+        """Points of profit at this price. Positive means in our favour on
+        either side."""
+        if not self.entry_price:
+            return 0.0
+        return (px - self.entry_price) if self.is_long \
+            else (self.entry_price - px)
+
+    def trail_target(self, px: float) -> float | None:
+        """
+        Where the stop should now sit, or None if it should not move.
+
+        Stage 1  profit >= X            -> stop to the entry price
+        Stage 2  every further Y        -> stop moves another Z
+        Stage 3  tighten only, and stay at least min_stop_pct behind price
+
+        Returns a tick-snapped price strictly better than the current stop,
+        or None. Never widens the stop and never returns a stop that has
+        already been passed by the market.
+        """
+        s = config.STRATEGY
+        if not s.get("trail_enabled"):
+            return None
+        if self.state != ENTERED or not self.entry_price or not self.stop_price:
+            return None
+
+        entry = self.entry_price
+        profit = self.open_profit(px)
+
+        x = float(s["trail_trigger_pct"]) / 100.0 * entry
+        if x <= 0 or profit < x:
+            return None                      # breakeven not earned yet
+
+        y = float(s["trail_step_pct"]) / 100.0 * entry
+        z = float(s["trail_move_pct"]) / 100.0 * entry
+
+        # how many whole Y-steps of profit beyond the trigger
+        steps = int((profit - x) // y) if y > 0 else 0
+        move = steps * z
+
+        # "cost to cost" is the entry price itself, then Z per step from there
+        target = entry + move if self.is_long else entry - move
+
+        # A step larger than the profit that earned it would otherwise walk
+        # the stop through the market. Hold it behind the current price.
+        gap = float(s["min_stop_pct"]) / 100.0 * entry
+        if self.is_long:
+            target = min(target, px - gap)
+        else:
+            target = max(target, px + gap)
+
+        tick = self.tick_size or 0.05
+        # round in the conservative direction on each side
+        target = round(round(target / tick) * tick, 2)
+
+        # ratchet: tighten only
+        if self.is_long and target <= self.stop_price + 1e-9:
+            return None
+        if (not self.is_long) and target >= self.stop_price - 1e-9:
+            return None
+
+        # never place a stop the market has already passed
+        if self.is_long and target >= px:
+            return None
+        if (not self.is_long) and target <= px:
+            return None
+
+        self._pending_steps = steps
+        return target
+
+    def apply_trail(self, new_stop: float, px: float) -> str:
+        """Move the stop and return a one-line description for the log."""
+        old = self.stop_price
+        self.stop_price = new_stop
+        steps = getattr(self, "_pending_steps", 0)
+        first_be = not self.breakeven_done
+        self.breakeven_done = True
+        self.trail_steps = max(self.trail_steps, steps)
+
+        if self.is_long:
+            self.best_price = max(self.best_price or px, px)
+        else:
+            self.best_price = min(self.best_price or px, px)
+
+        locked = (new_stop - self.entry_price) if self.is_long \
+            else (self.entry_price - new_stop)
+        if first_be and steps == 0:
+            return (f"stop to cost at {new_stop:.2f} "
+                    f"(was {old:.2f}, profit {self.open_profit(px):.2f})")
+        return (f"stop trailed {old:.2f} -> {new_stop:.2f} "
+                f"(step {steps}, locked {locked:+.2f}/share, "
+                f"profit {self.open_profit(px):.2f})")
+
+    def trailed(self) -> bool:
+        return bool(self.initial_stop) and \
+            abs(self.stop_price - self.initial_stop) > 1e-9
+
+    # ------------------------------------------------------------------
     def unrealized(self) -> float:
         if self.state != ENTERED or not self.qty or not self.ltp:
             return 0.0
@@ -277,5 +383,7 @@ class StockState:
             "stop": self.stop_price,
             "qty": self.qty,
             "pnl": self.pnl if self.state == CLOSED else self.unrealized(),
+            "trail": ("BE" if (self.breakeven_done and not self.trail_steps)
+                      else (f"+{self.trail_steps}" if self.trail_steps else "")),
             "note": self.note,
         }

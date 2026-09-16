@@ -160,6 +160,15 @@ class TradingEngine:
                 return
             logger.info("=" * 62)
             logger.info("MARKET OPEN — recording opening prices.")
+            t = config.STRATEGY
+            if t.get("trail_enabled"):
+                logger.info(f"Trail ON — stop to cost at "
+                            f"{t['trail_trigger_pct']}% profit, then "
+                            f"{t['trail_move_pct']}% further per "
+                            f"{t['trail_step_pct']}% of profit "
+                            f"(percentages of the entry price).")
+            else:
+                logger.info("Trail OFF — stop stays where the test put it.")
             logger.info("=" * 62)
             self._phase("live")
 
@@ -243,8 +252,20 @@ class TradingEngine:
         signal = st.on_tick(px, ts)
 
         if st.state == S.ENTERED:
+            # The trail is evaluated first so a stop raised on this tick is
+            # the one the breach check below uses. The engine moves its own
+            # stop immediately and is authoritative; the broker amendment is
+            # handed to the worker because it is a REST round trip.
+            new_stop = st.trail_target(px)
+            if new_stop is not None:
+                logger.info(f"{st.name}: {st.apply_trail(new_stop, px)}")
+                self._enqueue(("TRAIL", st.name, None))
+            else:
+                st.best_price = (max(st.best_price or px, px) if st.is_long
+                                 else min(st.best_price or px, px))
             if st.stop_breached(px):
-                self._enqueue(("EXIT", st.name, "STOP_HIT"))
+                self._enqueue(("EXIT", st.name,
+                               "TRAIL_HIT" if st.trailed() else "STOP_HIT"))
             return
 
         if signal == "ENTER" and not self.halted:
@@ -282,6 +303,8 @@ class TradingEngine:
                     self._do_entry(st)
                 elif kind == "EXIT":
                     self._do_exit(st, arg)
+                elif kind == "TRAIL":
+                    self._do_trail(st)
             except Exception as e:
                 logger.critical(f"{name}: {kind} failed: {e}", exc_info=True)
             finally:
@@ -466,6 +489,27 @@ class TradingEngine:
         self.feed.resubscribe()
 
     # ------------------------------------------------------------------
+    def _do_trail(self, st):
+        """Amend the resting stop. Takes the same lock as the exit so a trail
+        can never be sent against a position that is being closed."""
+        if st.state != S.ENTERED:
+            return
+        inst = st.instrument
+        if inst.get("kind") == "OPTION":
+            # The stop is a stock price level, so there is nothing resting at
+            # the broker to amend. The engine trail still applies.
+            return
+        lock = self.om.lock_for(st.name)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            if st.state != S.ENTERED:
+                return
+            self.om.modify_stop(st, inst, st.qty, st.stop_price)
+        finally:
+            lock.release()
+
+    # ------------------------------------------------------------------
     def _do_exit(self, st, reason):
         lock = self.om.lock_for(st.name)
         if not lock.acquire(blocking=False):
@@ -548,7 +592,9 @@ class TradingEngine:
                             logger.info(f"{s.name}: resting stop filled at "
                                         f"{px:.2f}; booking it.")
                             s.ltp = px or s.ltp
-                            self._enqueue(("EXIT", s.name, "STOP_HIT"))
+                            self._enqueue(("EXIT", s.name,
+                                           "TRAIL_HIT" if s.trailed()
+                                           else "STOP_HIT"))
 
             # ---- 09:30, win or lose ----
             if now >= config.square_off_dt():

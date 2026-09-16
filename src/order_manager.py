@@ -40,7 +40,9 @@ _TRADE_COLS = ["date", "name", "side", "instrument", "symbol", "gap_pct",
                "open_price", "test_extreme", "test_depth_pct",
                "entry_time", "entry_price", "stop_price", "qty",
                "risk_amount", "exit_time", "exit_price", "exit_reason",
-               "pnl", "pnl_pct_of_capital", "hold_seconds", "note"]
+               "pnl", "pnl_pct_of_capital", "hold_seconds",
+               "initial_stop", "final_stop", "trail_steps", "best_price",
+               "best_excursion", "note"]
 
 
 class OrderManager:
@@ -102,6 +104,12 @@ class OrderManager:
             "pnl": round(st.pnl, 2),
             "pnl_pct_of_capital": round(st.pnl / capital * 100.0, 4) if capital else 0.0,
             "hold_seconds": hold,
+            "initial_stop": round(st.initial_stop, 2),
+            "final_stop": round(st.stop_price, 2),
+            "trail_steps": st.trail_steps,
+            "best_price": round(st.best_price, 2) if st.best_price else "",
+            "best_excursion": (round(st.open_profit(st.best_price), 2)
+                               if st.best_price else ""),
             "note": st.note,
         }
         self.trades.append(row)
@@ -187,6 +195,70 @@ class OrderManager:
                             f"position is unprotected at the broker — the "
                             f"engine stop is the only cover.")
         return oid
+
+    def modify_stop(self, st, inst: dict, qty: int, trigger: float) -> bool:
+        """
+        Amend the resting stop to a new trigger.
+
+        Deliberately a modify and not a cancel-then-place: cancelling leaves
+        the position naked for the round trip, and inside a fifteen-minute
+        strategy that window is a real exposure rather than a theoretical one.
+        """
+        if config.TRADING_MODE != "LIVE" or not config.STRATEGY["place_exchange_sl"]:
+            return True                      # engine-side trail only
+        oid = self.sl_orders.get(st.name)
+        if not oid:
+            logger.warning(f"{st.name}: no resting stop to modify; the engine "
+                           f"stop is the only cover.")
+            return False
+
+        tick = inst.get("tick_size") or st.tick_size or 0.05
+        trig = round_to_tick(trigger, tick, "down" if st.is_long else "up")
+        limit = round_to_tick(trig - 3 * tick if st.is_long else trig + 3 * tick,
+                              tick, "down" if st.is_long else "up")
+
+        params = {
+            "variety": "STOPLOSS",
+            "orderid": str(oid),
+            "tradingsymbol": inst["symbol"],
+            "symboltoken": str(inst["token"]),
+            "exchange": inst["exchange"],
+            "ordertype": "STOPLOSS_LIMIT",
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": f"{limit:.2f}",
+            "triggerprice": f"{trig:.2f}",
+            "quantity": str(qty),
+        }
+        for attempt in range(2):
+            try:
+                api_rate_limiter.wait("modifyOrder")
+                config.SMART.modifyOrder(params)
+                st.stop_sent = trig
+                self._log_order(st.name, inst,
+                                "SELL" if st.is_long else "BUY", qty, trig,
+                                "STOPLOSS_LIMIT", order_id=str(oid),
+                                status="MODIFIED", detail="trail")
+                logger.info(f"{st.name}: resting stop moved to {trig:.2f} "
+                            f"(limit {limit:.2f})")
+                return True
+            except Exception as e:
+                msg = str(e)
+                logger.error(f"{st.name}: modify stop attempt {attempt+1} "
+                             f"failed: {msg}")
+                # If it already triggered there is nothing left to modify —
+                # the monitor will pick the fill up on its next poll.
+                if "not open" in msg.lower() or "cannot" in msg.lower():
+                    break
+                time.sleep(0.6)
+
+        self._log_order(st.name, inst, "SELL" if st.is_long else "BUY", qty,
+                        trigger, "STOPLOSS_LIMIT", order_id=str(oid),
+                        status="MODIFY_FAILED", detail="trail")
+        logger.critical(f"{st.name}: TRAIL NOT APPLIED AT THE BROKER. The "
+                        f"resting stop is still at {st.stop_sent or st.initial_stop:.2f} "
+                        f"while the engine is working {trigger:.2f}.")
+        return False
 
     def stop_filled(self, name) -> tuple[bool, float]:
         """Has the resting stop already done its job? Returns (filled, price)."""

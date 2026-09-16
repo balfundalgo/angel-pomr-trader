@@ -247,6 +247,22 @@ class App(ctk.CTk):
         self.e_losscap = self._field(sg, "Daily loss cap %", s["daily_loss_cap_pct"])
         ctk.CTkLabel(sg, text="", height=4).pack()
 
+        tr = self._card(left, "Trailing stop",
+                        "Off by default — prove the plain version first")
+        tr.pack(fill="x", pady=(0, 10))
+        self.v_trail = self._switch(tr, "Enable trail", s["trail_enabled"])
+        self.e_tx = self._field(tr, "Stop to cost at", s["trail_trigger_pct"],
+                                hint="% profit  (X)")
+        self.e_ty = self._field(tr, "Then every", s["trail_step_pct"],
+                                hint="% profit  (Y)")
+        self.e_tz = self._field(tr, "Move stop by", s["trail_move_pct"],
+                                hint="% of entry  (Z)")
+        ctk.CTkLabel(tr, text="All three are percentages of the entry price, so "
+                              "they behave the\nsame on a Rs 670 stock and a Rs "
+                              "9,200 one. The stop only\never tightens.",
+                     text_color=SUB, font=("Segoe UI", 10),
+                     justify="left").pack(anchor="w", padx=16, pady=(2, 12))
+
         ins = self._card(left, "Instrument")
         ins.pack(fill="x", pady=(0, 10))
         self.v_inst = self._option(ins, "Trade", ["STOCK", "OPTION"],
@@ -319,10 +335,10 @@ class App(ctk.CTk):
 
     def _build_table(self, parent):
         cols = ("name", "side", "gap", "open", "extreme", "ltp", "entry",
-                "stop", "qty", "state", "pnl")
+                "stop", "trail", "qty", "state", "pnl")
         heads = ("Stock", "Side", "Gap %", "Open", "Extreme", "LTP", "Entry",
-                 "Stop", "Qty", "State", "P&L")
-        widths = (110, 62, 70, 86, 86, 86, 86, 86, 62, 116, 96)
+                 "Stop", "Trail", "Qty", "State", "P&L")
+        widths = (104, 58, 66, 82, 82, 82, 82, 82, 50, 56, 108, 92)
 
         style = ttk.Style()
         try:
@@ -397,6 +413,18 @@ class App(ctk.CTk):
         s["max_positions"] = int(self.e_maxop.get())
         s["daily_loss_cap_pct"] = float(self.e_losscap.get())
 
+        s["trail_enabled"] = bool(self.v_trail.get())
+        s["trail_trigger_pct"] = float(self.e_tx.get())
+        s["trail_step_pct"] = float(self.e_ty.get())
+        s["trail_move_pct"] = float(self.e_tz.get())
+        if s["trail_enabled"]:
+            if s["trail_trigger_pct"] <= 0:
+                raise ValueError("the breakeven trigger must be above zero")
+            if s["trail_step_pct"] <= 0:
+                raise ValueError("the step size must be above zero")
+            if s["trail_move_pct"] <= 0:
+                raise ValueError("the stop move must be above zero")
+
         s["instrument"] = self.v_inst.get()
         s["short_instrument"] = self.v_short.get()
         s["option_max_spread_pct"] = float(self.e_ospread.get())
@@ -428,6 +456,16 @@ class App(ctk.CTk):
                            "when a test-and-reclaim can be spread noise "
                            "rather than a real move. Watch the "
                            "'clearly-through' buffer.")
+        if config.STRATEGY["trail_enabled"]:
+            t = config.STRATEGY
+            logger.info(f"Trail ON — stop to cost at {t['trail_trigger_pct']}% "
+                        f"profit, then {t['trail_move_pct']}% further per "
+                        f"{t['trail_step_pct']}% of profit.")
+            if t["trail_move_pct"] > t["trail_step_pct"]:
+                logger.warning("The stop moves further per step than the profit "
+                               "that earns it. The stop is held behind the "
+                               "market so it cannot overtake price, but the "
+                               "trail will tighten very quickly.")
         if config.TRADING_MODE == "LIVE":
             logger.warning("LIVE MODE — real orders will be sent.")
         config.save_settings()
@@ -524,6 +562,7 @@ class App(ctk.CTk):
                 f"{r['ltp']:.2f}" if r["ltp"] else "—",
                 f"{r['entry']:.2f}" if r["entry"] else "—",
                 f"{r['stop']:.2f}" if r["stop"] else "—",
+                r.get("trail") or "—",
                 r["qty"] or "—",
                 r["state"],
                 f"{pnl:+,.0f}" if pnl else "—",

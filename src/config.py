@@ -68,6 +68,20 @@ STRATEGY = {
     "max_test_pct":     1.50,         # guard rail: test too deep -> skip
     "max_position_pct": 33.33,        # guard rail: no position over a third
 
+    # ---- trailing stop (off by default) ----
+    # A three-stage ratchet, all three measured as a percentage of the
+    # ENTRY price so the behaviour is identical on a Rs 670 stock and a
+    # Rs 9,200 one:
+    #   1. profit reaches trail_trigger_pct  -> stop moves to the entry price
+    #   2. every further trail_step_pct      -> stop moves trail_move_pct more
+    #   3. the stop only ever tightens; a retrace never gives a step back
+    # The stop is also held at least min_stop_pct behind the current price,
+    # so a move larger than the step can never walk the stop into the market.
+    "trail_enabled":    False,
+    "trail_trigger_pct": 0.50,        # X — breakeven trigger
+    "trail_step_pct":   0.25,         # Y — each further step of profit
+    "trail_move_pct":   0.25,         # Z — how far the stop moves per step
+
     # ---- daily limits ----
     "max_trades":       4,            # total entries for the session
     "max_positions":    4,            # open at any one moment
