@@ -20,10 +20,12 @@ import csv
 import os
 
 import config
+import cautionary
 from logger import logger
 
 # Reject reasons, in the order they are applied.
 R_EXCLUDED = "manual exclusion (ex-div / split)"
+R_CAUTION = "under exchange surveillance (API-blocked)"
 R_NO_AUCTION = "no auction trades"
 R_THIN = "thin auction"
 R_PRICE = "price under floor"
@@ -34,6 +36,7 @@ def apply_filters(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split the snapshot into (survivors, rejects-with-reason)."""
     s = config.STRATEGY
     excl = config.exclusion_set()
+    blocked = cautionary.active()
     keep, drop = [], []
 
     for r in rows:
@@ -41,6 +44,10 @@ def apply_filters(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 
         if r["name"].upper() in excl:
             reason = R_EXCLUDED
+        elif r["name"].upper() in blocked:
+            # Angel will refuse these in the cash segment, so letting one onto
+            # the watchlist only burns a slot that a tradeable name could use.
+            reason = R_CAUTION
         elif r["auction_price"] <= 0 or r["prev_close"] <= 0 \
                 or r["auction_qty"] <= 0:
             reason = R_NO_AUCTION

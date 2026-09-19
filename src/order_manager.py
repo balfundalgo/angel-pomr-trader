@@ -32,6 +32,7 @@ import config
 from logger import logger
 from api_rate_limiter import api_rate_limiter
 from angel_data import round_to_tick
+import cautionary
 
 _ORDER_COLS = ["time", "mode", "name", "instrument", "symbol", "side",
                "qty", "price", "order_type", "order_id", "status", "detail"]
@@ -136,7 +137,7 @@ class OrderManager:
             return px
 
         oid = self._send(self._market_params(inst, qty, side),
-                         f"ENTRY {side} {qty} {inst['symbol']}")
+                         f"ENTRY {side} {qty} {inst['symbol']}", st.name)
         self._log_order(st.name, inst, side, qty, ref_price, "MARKET",
                         order_id=oid or "", status="SUBMITTED")
         ok, fill, detail = self._verify(oid, f"ENTRY {side} {inst['symbol']}")
@@ -182,14 +183,22 @@ class OrderManager:
             "triggerprice": f"{trig:.2f}",
             "quantity": str(qty),
         }
-        oid = self._send(params, f"STOP {side} {qty} {inst['symbol']} @ {trig}")
+        oid = self._send(params, f"STOP {side} {qty} {inst['symbol']} @ {trig}",
+                         st.name)
         self._log_order(st.name, inst, side, qty, trig, "STOPLOSS_LIMIT",
                         order_id=oid or "",
                         status="RESTING" if oid else "FAILED")
-        if oid:
+        if oid and self._verify_sl_rests(oid, trig):
             self.sl_orders[st.name] = oid
+            st.stop_sent = trig
             logger.info(f"{st.name}: protective stop resting at {trig:.2f} "
-                        f"(limit {limit:.2f}), id={oid}")
+                        f"(limit {limit:.2f}), id={oid} — verified at exchange")
+        elif oid:
+            # Placed but not resting. A dead order is not protection.
+            logger.critical(f"{st.name}: protective stop {oid} did NOT rest at "
+                            f"{trig:.2f} — position UNPROTECTED at the broker, "
+                            f"CHECK THE TERMINAL. The engine stop is the only "
+                            f"cover.")
         else:
             logger.critical(f"{st.name}: PROTECTIVE STOP NOT PLACED. The "
                             f"position is unprotected at the broker — the "
@@ -234,14 +243,20 @@ class OrderManager:
             try:
                 api_rate_limiter.wait("modifyOrder")
                 config.SMART.modifyOrder(params)
-                st.stop_sent = trig
-                self._log_order(st.name, inst,
-                                "SELL" if st.is_long else "BUY", qty, trig,
-                                "STOPLOSS_LIMIT", order_id=str(oid),
-                                status="MODIFIED", detail="trail")
-                logger.info(f"{st.name}: resting stop moved to {trig:.2f} "
-                            f"(limit {limit:.2f})")
-                return True
+                # A returning call is not proof the exchange took it. Read it
+                # back before believing the stop has moved.
+                if self._verify_sl_rests(oid, trig):
+                    st.stop_sent = trig
+                    self._log_order(st.name, inst,
+                                    "SELL" if st.is_long else "BUY", qty, trig,
+                                    "STOPLOSS_LIMIT", order_id=str(oid),
+                                    status="MODIFIED", detail="trail verified")
+                    logger.info(f"{st.name}: resting stop moved to {trig:.2f} "
+                                f"(limit {limit:.2f}) — verified")
+                    return True
+                logger.warning(f"{st.name}: modify did not take at the exchange "
+                               f"(wanted {trig:.2f}); replacing the stop.")
+                return self._replace_stop(st, inst, qty, trig, limit)
             except Exception as e:
                 msg = str(e)
                 logger.error(f"{st.name}: modify stop attempt {attempt+1} "
@@ -258,6 +273,36 @@ class OrderManager:
         logger.critical(f"{st.name}: TRAIL NOT APPLIED AT THE BROKER. The "
                         f"resting stop is still at {st.stop_sent or st.initial_stop:.2f} "
                         f"while the engine is working {trigger:.2f}.")
+        return False
+
+    def _replace_stop(self, st, inst, qty, trig, limit) -> bool:
+        """Cancel the tracked stop and place a fresh one at the wanted trigger,
+        then verify. Used only when a modify silently fails."""
+        self.cancel_stop(st.name)
+        oid = self._send({
+            "variety": "STOPLOSS",
+            "tradingsymbol": inst["symbol"],
+            "symboltoken": str(inst["token"]),
+            "transactiontype": "SELL" if st.is_long else "BUY",
+            "exchange": inst["exchange"],
+            "ordertype": "STOPLOSS_LIMIT",
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": f"{limit:.2f}",
+            "triggerprice": f"{trig:.2f}",
+            "quantity": str(qty),
+        }, f"REPLACE STOP {inst['symbol']} @ {trig}")
+        if oid and self._verify_sl_rests(oid, trig):
+            self.sl_orders[st.name] = oid
+            st.stop_sent = trig
+            logger.info(f"{st.name}: stop replaced -> id {oid} @ {trig:.2f} "
+                        f"(verified)")
+            return True
+        if oid:
+            self.sl_orders[st.name] = oid
+        logger.critical(f"{st.name}: could not re-establish the resting stop at "
+                        f"{trig:.2f} — position may be UNPROTECTED at the "
+                        f"broker, CHECK THE TERMINAL.")
         return False
 
     def stop_filled(self, name) -> tuple[bool, float]:
@@ -285,9 +330,14 @@ class OrderManager:
     # exit
     # ------------------------------------------------------------------
     def exit(self, st, inst: dict, qty: int, ref_price: float,
-             reason: str) -> tuple[float, str]:
+             reason: str) -> tuple[float, str, bool]:
         """
-        Close the position. Returns (fill_price, resolved_reason).
+        Close the position. Returns (fill_price, resolved_reason, ok).
+
+        ok is False when the broker did not confirm the exit. The caller MUST
+        NOT book the trade in that case: the position is still open at the
+        broker, and recording a phantom close would put the app's P&L and its
+        position state permanently out of step with reality.
 
         Resolves the resting stop first so we can never send a second sell
         against a position the exchange has already closed.
@@ -303,11 +353,12 @@ class OrderManager:
                 self._log_order(st.name, inst, side, qty, fill_px,
                                 "STOPLOSS_LIMIT", status="COMPLETE",
                                 detail="resting stop filled")
-                return fill_px, "STOP_HIT"
+                return fill_px, ("TRAIL_HIT" if st.trailed() else "STOP_HIT"), True
             self.cancel_stop(st.name)
 
             oid = self._send(self._market_params(inst, qty, side),
-                             f"EXIT {side} {qty} {inst['symbol']} ({reason})")
+                             f"EXIT {side} {qty} {inst['symbol']} ({reason})",
+                             st.name)
             self._log_order(st.name, inst, side, qty, ref_price, "MARKET",
                             order_id=oid or "", status="SUBMITTED",
                             detail=reason)
@@ -317,16 +368,18 @@ class OrderManager:
                             status="COMPLETE" if ok else "FAILED",
                             detail=f"{reason}; {detail}")
             if not ok:
-                logger.critical(f"!!! EXIT MAY HAVE FAILED for {st.name} "
-                                f"({reason}). CHECK THE TERMINAL — the "
-                                f"position may still be OPEN. !!!")
-            return (fill or ref_price), reason
+                logger.critical(f"!!! EXIT NOT CONFIRMED for {st.name} "
+                                f"({reason}) — NOT booked. The position is "
+                                f"still OPEN at the broker. CHECK THE "
+                                f"TERMINAL. {detail} !!!")
+                return 0.0, reason, False
+            return (fill or ref_price), reason, True
 
         px = self._paper_fill(ref_price, side)
         self._log_order(st.name, inst, side, qty, px, "MARKET",
                         status="PAPER_FILL", detail=reason)
         logger.info(f"[PAPER] {side} {qty} {inst['symbol']} @ {px:.2f} ({reason})")
-        return px, reason
+        return px, reason, True
 
     def book_pnl(self, st):
         self.realized += st.pnl
@@ -353,26 +406,159 @@ class OrderManager:
             "quantity": str(qty),
         }
 
-    def _send(self, params, label):
+    def _send(self, params, label, name: str = ""):
+        """
+        Submit an order and, crucially, surface WHY it was refused.
+
+        SmartAPI's placeOrder() returns the order id on success and plain
+        None on failure — the broker's message and error code are discarded
+        inside the SDK before we ever see them. placeOrderFullResponse()
+        hands back the whole envelope, so a rejection tells us what actually
+        happened instead of "bad id: None". We fall back to placeOrder() only
+        where the SDK is too old to have it.
+        """
         for attempt in range(config.RETRY["max_retries"]):
             try:
                 api_rate_limiter.wait("placeOrder")
-                oid = config.SMART.placeOrder(params)
+                oid, detail = self._submit(params)
                 if oid and len(str(oid)) > 4:
                     logger.info(f"Order submitted [{label}] id={oid}")
                     return str(oid)
-                logger.error(f"Order returned bad id [{label}]: {oid}")
+                logger.error(f"Order refused [{label}] attempt {attempt+1}: "
+                             f"{detail or 'no id and no message from the broker'}")
+                if self._fatal_reject(detail, label, name):
+                    return None
             except Exception as e:
                 msg = str(e)
                 logger.error(f"Order error [{label}] attempt {attempt+1}: {msg}")
-                if "short" in msg.lower() and "not allow" in msg.lower():
-                    logger.critical("Broker rejected the short on this scrip. "
-                                    "Switch short_instrument to FUTURES for "
-                                    "this name.")
+                if self._fatal_reject(msg, label, name):
                     return None
             time.sleep([1, 2, 4][min(attempt, 2)])
         logger.critical(f"Order FAILED after retries [{label}]")
         return None
+
+    @staticmethod
+    def _submit(params) -> tuple[str | None, str]:
+        """Returns (order_id, detail). detail carries the broker's own words."""
+        obj = config.SMART
+        full = getattr(obj, "placeOrderFullResponse", None)
+        if callable(full):
+            resp = full(params) or {}
+            data = resp.get("data") or {}
+            oid = data.get("orderid") or data.get("uniqueorderid")
+            if oid:
+                return str(oid), ""
+            bits = [str(resp.get("message") or "").strip(),
+                    str(resp.get("errorcode") or "").strip()]
+            detail = " | ".join(b for b in bits if b) or str(resp)[:300]
+            return None, detail
+        # older SDK: no message available, only the id or None
+        return obj.placeOrder(params), ""
+
+    @staticmethod
+    def _fatal_reject(detail: str, label: str, name: str = "") -> bool:
+        """True when retrying cannot possibly help. Each of these is a
+        configuration, permission or regulatory problem, not a transient one."""
+        d = (detail or "").lower()
+        if not d:
+            return False
+        # Exchange surveillance: Angel blocks these from placeOrder in the
+        # EQUITY segment only. Retrying is pointless — it will be refused
+        # every time, today and tomorrow — so record it and move on.
+        if "ab4036" in d or "cautionary" in d or "surveillance" in d:
+            if name:
+                cautionary.record(name)
+            else:
+                logger.critical("Order refused: the scrip is under exchange "
+                                "surveillance and cannot be traded through the "
+                                "API in the cash segment.")
+            return True
+        if ("short" in d and ("not allow" in d or "block" in d)):
+            logger.critical("Broker rejected the short on this scrip. Switch "
+                            "'Short side via' to FUTURES for this name.")
+            return True
+        if any(k in d for k in ("invalid api", "access denied", "not authorized",
+                                "unauthori", "permission", "invalid token",
+                                "session expire", "ab1050", "ab1010")):
+            logger.critical("The broker refused the order on AUTHORISATION, not "
+                            "on the order itself. The login, quotes and feed can "
+                            "all work on a key that has no trading rights — check "
+                            "that the Angel app is a TRADING API app and that the "
+                            "API key in use belongs to it.")
+            return True
+        if any(k in d for k in ("margin", "insufficient", "fund")):
+            logger.critical("The broker refused the order for MARGIN. Reduce "
+                            "risk per trade or max position %, or fund the "
+                            "account.")
+            return True
+        if "rms" in d:
+            logger.critical(f"Broker RMS rejection [{label}]: {detail}")
+            return True
+        return False
+
+
+    def fetch_order_book(self) -> dict:
+        """{orderid: row} in ONE API call, so a verification pass costs one
+        request instead of one per order."""
+        try:
+            api_rate_limiter.wait("orderBook")
+            book = config.SMART.orderBook()
+            return {str(r.get("orderid")): r
+                    for r in (book or {}).get("data", []) or []}
+        except Exception as e:
+            logger.error(f"orderBook fetch failed: {e}")
+            return {}
+
+    def fetch_positions(self) -> dict | None:
+        """{tradingsymbol: netqty} from the broker, or None if unreadable.
+        Used to prove we are actually flat after the 09:30 square-off."""
+        for meth in ("position", "getPosition", "positionData"):
+            fn = getattr(config.SMART, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                api_rate_limiter.wait("position")
+                resp = fn()
+                out = {}
+                for row in (resp or {}).get("data") or []:
+                    sym = str(row.get("tradingsymbol")
+                              or row.get("symbolname") or "")
+                    try:
+                        net = int(float(row.get("netqty", 0) or 0))
+                    except (TypeError, ValueError):
+                        net = 0
+                    if sym:
+                        out[sym] = net
+                return out
+            except Exception as e:
+                logger.error(f"positions fetch via {meth} failed: {e}")
+                return None
+        return None
+
+    def _verify_sl_rests(self, oid, want_trigger, tries=3) -> bool:
+        """
+        Confirm the order is a LIVE resting stop whose trigger at the exchange
+        is the one we intended.
+
+        A returning SDK call is not proof. An order can be accepted and then
+        rejected by RMS a moment later, and a modify can silently not take —
+        in both cases the position is unprotected while the app believes it
+        is covered.
+        """
+        for _ in range(tries):
+            row = self.fetch_order_book().get(str(oid))
+            if row:
+                status = str(row.get("status", "")).lower()
+                if status in ("cancelled", "rejected", "complete", "filled"):
+                    return False
+                try:
+                    got = float(row.get("triggerprice") or 0)
+                except (TypeError, ValueError):
+                    got = 0.0
+                if abs(got - round(float(want_trigger), 2)) < 0.06:
+                    return True
+            time.sleep(0.5)
+        return False
 
     def _order_status(self, order_id):
         """(status_lower, avg_price, text) for an order id."""

@@ -79,6 +79,7 @@ class TradingEngine:
                 return
 
             self._read_capital()
+            self._preflight()
 
             self._phase("universe")
             if not angel_data.download_scrip_master():
@@ -94,7 +95,7 @@ class TradingEngine:
             # ---------------- 09:08:30 : the scan ----------------
             self._phase("waiting for the scan")
             if not self._sleep_until(config.today_at(config.STRATEGY["scan_time"]),
-                                     "the 09:08:30 scan"):
+                                     f"the {config.STRATEGY['scan_time']} scan"):
                 return
 
             self._phase("scanning")
@@ -204,6 +205,32 @@ class TradingEngine:
                 return False
             time.sleep(0.25)
         return True
+
+    def _preflight(self):
+        """
+        Prove the session can actually trade BEFORE the open.
+
+        Login, quotes and the WebSocket all work on an Angel app that has no
+        order permissions, so the first sign of trouble is an entry failing
+        at 09:15 with the session already half over. Reading the order book
+        exercises the same permission the order path needs, at 08:11 instead.
+        """
+        if config.TRADING_MODE != "LIVE":
+            return
+        try:
+            api_rate_limiter.wait("orderBook")
+            resp = config.SMART.orderBook()
+            if resp is None or (isinstance(resp, dict)
+                                and resp.get("status") is False):
+                raise RuntimeError(str(resp)[:300])
+            n = len((resp or {}).get("data") or [])
+            logger.info(f"Pre-flight: order permissions OK "
+                        f"({n} order(s) in today's book).")
+        except Exception as e:
+            logger.critical("PRE-FLIGHT FAILED — this session can read prices "
+                            "but may not be able to place orders. Check that "
+                            "the Angel app is a TRADING API app and that the "
+                            "API key belongs to it. Details: " + str(e)[:300])
 
     def _read_capital(self):
         if config.STRATEGY["use_live_balance"]:
@@ -522,7 +549,18 @@ class TradingEngine:
             if inst["kind"] == "STOCK" or inst["kind"] == "FUTURE":
                 ref = st.ltp
 
-            fill, resolved = self.om.exit(st, inst, st.qty, ref, reason)
+            fill, resolved, ok = self.om.exit(st, inst, st.qty, ref, reason)
+            if not ok:
+                # The broker did not confirm. Leave the position OPEN in the
+                # app so it keeps being managed and keeps being retried, and
+                # so nothing phantom reaches the trade log.
+                st.exit_attempts = getattr(st, "exit_attempts", 0) + 1
+                if st.exit_attempts >= 3:
+                    logger.critical(f"{st.name}: {st.exit_attempts} exit "
+                                    f"attempts have failed. Backing off until "
+                                    f"the square-off sweep. CLOSE THIS "
+                                    f"MANUALLY IF IT IS STILL OPEN.")
+                return
 
             st.exit_price = fill
             st.exit_time = datetime.now()
@@ -603,6 +641,7 @@ class TradingEngine:
                 logger.info("=" * 62)
                 self._close_all("TIME_EXIT")
                 self._wait_flat()
+                self._verify_flat()
                 self._end_of_day()
                 return
 
@@ -615,7 +654,28 @@ class TradingEngine:
     def _close_all(self, reason):
         for s in self.states.values():
             if s.state == S.ENTERED:
+                if reason != "TIME_EXIT" and getattr(s, "exit_attempts", 0) >= 3:
+                    continue          # backed off; the square-off sweep retries
                 self._enqueue(("EXIT", s.name, reason))
+
+    def _verify_flat(self):
+        """Ask the broker what it thinks we are holding. The app believing it
+        is flat is not the same as being flat."""
+        if config.TRADING_MODE != "LIVE":
+            return
+        pos = self.om.fetch_positions()
+        if pos is None:
+            logger.warning("Could not read positions from the broker — verify "
+                           "in the terminal that everything is squared off.")
+            return
+        ours = {s.instrument.get("symbol") for s in self.states.values()
+                if s.instrument}
+        live = {sym: q for sym, q in pos.items() if q and sym in ours}
+        if live:
+            logger.critical(f"!!! BROKER STILL SHOWS OPEN QUANTITY: {live}. "
+                            f"SQUARE OFF MANUALLY NOW. !!!")
+        else:
+            logger.info("Broker positions confirm flat.")
 
     def _wait_flat(self, timeout=25):
         deadline = time.time() + timeout

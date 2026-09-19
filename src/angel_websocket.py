@@ -54,7 +54,11 @@ class WebSocketFeed:
             self.tokens_by_exch[ex].append(str(token))
 
     def _sub_list(self):
-        return [{"exchangeType": ex, "tokens": toks}
+        # A COPY of each token list, not the list itself. The SDK keeps the
+        # object it is handed for its own resubscribe bookkeeping and appends
+        # to it on reconnect — passing the live list is why the subscribed
+        # count doubled on every post-session reconnect.
+        return [{"exchangeType": ex, "tokens": list(toks)}
                 for ex, toks in self.tokens_by_exch.items() if toks]
 
     def token_count(self):
