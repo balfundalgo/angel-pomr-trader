@@ -51,6 +51,9 @@ class OrderManager:
         self.realized = 0.0
         self.trades = []                 # completed round trips
         self.sl_orders = {}              # name -> resting SL order id
+        self._book_cache = None          # shared order-book snapshot
+        self._book_at = 0.0
+        self._book_fails = 0
         self._locks = {}                 # name -> lock (one exit at a time)
         self._ensure_csv()
 
@@ -305,12 +308,13 @@ class OrderManager:
                         f"broker, CHECK THE TERMINAL.")
         return False
 
-    def stop_filled(self, name) -> tuple[bool, float]:
-        """Has the resting stop already done its job? Returns (filled, price)."""
+    def stop_filled(self, name, book=None) -> tuple[bool, float]:
+        """Has the resting stop already done its job? Returns (filled, price).
+        Pass a shared book when checking several positions at once."""
         oid = self.sl_orders.get(name)
         if not oid or config.TRADING_MODE != "LIVE":
             return False, 0.0
-        status, price, _ = self._order_status(oid)
+        status, price, _ = self._order_status(oid, book)
         if status in ("complete", "filled"):
             return True, price
         return False, 0.0
@@ -497,17 +501,41 @@ class OrderManager:
         return False
 
 
-    def fetch_order_book(self) -> dict:
-        """{orderid: row} in ONE API call, so a verification pass costs one
-        request instead of one per order."""
+    # The order book is the single most-requested endpoint in this app and
+    # Angel refuses with "Access denied because of exceeding access rate" long
+    # before the per-second limiter alone would stop us. A short cache means
+    # several look-ups inside the same moment cost one request.
+    _BOOK_TTL = 2.0
+
+    def fetch_order_book(self, force: bool = False) -> dict:
+        """{orderid: row}, cached for a couple of seconds."""
+        now = time.time()
+        if (not force) and self._book_cache is not None \
+                and (now - self._book_at) < self._BOOK_TTL:
+            return self._book_cache
         try:
             api_rate_limiter.wait("orderBook")
-            book = config.SMART.orderBook()
-            return {str(r.get("orderid")): r
-                    for r in (book or {}).get("data", []) or []}
+            resp = config.SMART.orderBook()
+            book = {str(r.get("orderid")): r
+                    for r in (resp or {}).get("data", []) or []}
+            self._book_cache, self._book_at = book, now
+            self._book_fails = 0
+            return book
         except Exception as e:
-            logger.error(f"orderBook fetch failed: {e}")
-            return {}
+            msg = str(e)
+            self._book_fails += 1
+            if "access rate" in msg.lower() or "exceeding" in msg.lower():
+                # Back off rather than hammering a door that is already shut.
+                api_rate_limiter.penalise("orderBook", 2.0)
+                if self._book_fails in (1, 5, 20):
+                    logger.warning(f"Order book is rate limited by the broker "
+                                   f"(failure {self._book_fails}); backing off. "
+                                   f"Stops resting at the exchange are "
+                                   f"unaffected.")
+            else:
+                logger.error(f"orderBook fetch failed: {e}")
+            # Serve the last good copy rather than pretending the book is empty
+            return self._book_cache if self._book_cache is not None else {}
 
     def fetch_positions(self) -> dict | None:
         """{tradingsymbol: netqty} from the broker, or None if unreadable.
@@ -546,7 +574,7 @@ class OrderManager:
         is covered.
         """
         for _ in range(tries):
-            row = self.fetch_order_book().get(str(oid))
+            row = self.fetch_order_book(force=True).get(str(oid))
             if row:
                 status = str(row.get("status", "")).lower()
                 if status in ("cancelled", "rejected", "complete", "filled"):
@@ -560,23 +588,20 @@ class OrderManager:
             time.sleep(0.5)
         return False
 
-    def _order_status(self, order_id):
-        """(status_lower, avg_price, text) for an order id."""
+    def _order_status(self, order_id, book=None):
+        """(status_lower, avg_price, text) for an order id, off the shared
+        order book rather than a request of its own."""
+        if book is None:
+            book = self.fetch_order_book()
+        row = book.get(str(order_id))
+        if not row:
+            return None, 0.0, ""
         try:
-            api_rate_limiter.wait("orderBook")
-            book = config.SMART.orderBook()
-            for row in (book or {}).get("data", []) or []:
-                if str(row.get("orderid")) == str(order_id):
-                    px = row.get("averageprice") or row.get("price") or 0
-                    try:
-                        px = float(px)
-                    except Exception:
-                        px = 0.0
-                    return (str(row.get("status", "")).lower(), px,
-                            str(row.get("text", "")))
-        except Exception as e:
-            logger.error(f"orderBook lookup failed for {order_id}: {e}")
-        return None, 0.0, ""
+            px = float(row.get("averageprice") or row.get("price") or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        return (str(row.get("status", "")).lower(), px,
+                str(row.get("text", "")))
 
     def _verify(self, order_id, label):
         """Poll until the order is resolved. Returns (ok, fill_price, detail).
@@ -587,7 +612,8 @@ class OrderManager:
         if not order_id:
             return False, 0.0, "no order id returned"
         for _ in range(6):
-            status, px, text = self._order_status(order_id)
+            status, px, text = self._order_status(order_id,
+                                                  self.fetch_order_book(force=True))
             if status is None:
                 time.sleep(0.8)
                 continue

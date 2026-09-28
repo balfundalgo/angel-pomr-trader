@@ -30,6 +30,7 @@ from logger import logger
 from angel_connection import connection_manager
 from angel_websocket import WebSocketFeed
 from order_manager import OrderManager
+from api_rate_limiter import api_rate_limiter
 import angel_data
 import scanner
 import strategy as S
@@ -621,11 +622,17 @@ class TradingEngine:
                     self._close_all("LOSS_CAP")
 
             # ---- resting stops that fired without us ----
-            if config.TRADING_MODE == "LIVE" and time.time() - last_sl_poll > 3:
+            if config.TRADING_MODE == "LIVE" and time.time() - last_sl_poll > 4:
                 last_sl_poll = time.time()
-                for s in list(self.states.values()):
-                    if s.state == S.ENTERED and self.om.sl_orders.get(s.name):
-                        filled, px = self.om.stop_filled(s.name)
+                watching = [s for s in self.states.values()
+                            if s.state == S.ENTERED and self.om.sl_orders.get(s.name)]
+                if watching:
+                    # One order-book read covers every open position. Polling
+                    # each one separately is what tipped the account over
+                    # Angel's access-rate limit.
+                    book = self.om.fetch_order_book()
+                    for s in watching:
+                        filled, px = self.om.stop_filled(s.name, book)
                         if filled:
                             logger.info(f"{s.name}: resting stop filled at "
                                         f"{px:.2f}; booking it.")

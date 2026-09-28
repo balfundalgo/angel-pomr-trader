@@ -100,7 +100,9 @@ class EndpointRateLimiter:
             # LTP: keep fast
             "ltpData": 0.12,         # ~8 calls/sec
             # Books / positions are typically stricter
-            "orderBook": 1.05,       # ~1 call/sec
+            # Angel refuses well before a strict 1/sec in practice, and the
+            # order book is polled continuously while positions are open.
+            "orderBook": 1.60,
             "tradeBook": 1.05,
             "position": 1.05,
             # Orders: keep separate and fast
@@ -152,6 +154,31 @@ class EndpointRateLimiter:
     def min_delay(self) -> float:
         # Old global value; return a representative slow endpoint delay
         return float(self._buckets["orderBook"].min_interval)
+
+
+    def penalise(self, key: str, seconds: float = 2.0):
+        """Temporarily slow a bucket after the broker has refused us for rate.
+        Decays back to the configured interval on the next clean call."""
+        try:
+            bucket = self._buckets.get(self._normalise(key)) \
+                if hasattr(self, "_normalise") else None
+        except Exception:
+            bucket = None
+        if bucket is None:
+            bucket = self._buckets.get(key)
+        if bucket is None:
+            return
+        base = getattr(bucket, "_base_interval", None)
+        if base is None:
+            bucket._base_interval = bucket.min_interval
+            base = bucket.min_interval
+        bucket.min_interval = min(base * 8, bucket.min_interval + seconds)
+
+    def relax(self, key: str):
+        bucket = self._buckets.get(key)
+        if bucket is not None and getattr(bucket, "_base_interval", None):
+            bucket.min_interval = bucket._base_interval
+
 
 
 # Shared instance used by all modules
