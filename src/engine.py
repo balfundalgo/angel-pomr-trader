@@ -151,8 +151,11 @@ class TradingEngine:
             logger.info(f"Feed verified for {self.feed.token_count()} tokens.")
 
             # ---------------- workers ----------------
-            for target, nm in ((self._worker, "pomr-worker"),
-                               (self._monitor, "pomr-monitor")):
+            workers = [(self._worker, "pomr-worker"),
+                       (self._monitor, "pomr-monitor")]
+            if config.TRADING_MODE == "LIVE":
+                workers.append((self._reconcile_loop, "pomr-reconciler"))
+            for target, nm in workers:
                 th = threading.Thread(target=target, daemon=True, name=nm)
                 th.start()
                 self._threads.append(th)
@@ -292,8 +295,23 @@ class TradingEngine:
                 st.best_price = (max(st.best_price or px, px) if st.is_long
                                  else min(st.best_price or px, px))
             if st.stop_breached(px):
-                self._enqueue(("EXIT", st.name,
-                               "TRAIL_HIT" if st.trailed() else "STOP_HIT"))
+                reason = "TRAIL_HIT" if st.trailed() else "STOP_HIT"
+                resting = (config.TRADING_MODE == "LIVE"
+                           and self.om.sl_orders.get(st.name))
+                if resting:
+                    # The exchange stop IS the exit. Sending our own market
+                    # order on the same breach races it: the exchange fills,
+                    # our order fills too, and the position ends up reversed
+                    # instead of flat. Record the breach and let the monitor
+                    # confirm the broker's fill.
+                    if not getattr(st, "stop_breach_at", None):
+                        st.stop_breach_at = datetime.now()
+                        logger.info(f"{st.name}: price reached the stop "
+                                    f"({st.stop_price:.2f}). Waiting for the "
+                                    f"resting order at the exchange to "
+                                    f"confirm.")
+                    return
+                self._enqueue(("EXIT", st.name, reason))
             return
 
         if signal == "ENTER" and not self.halted:
@@ -580,6 +598,120 @@ class TradingEngine:
             lock.release()
 
     # ==================================================================
+    # reconciler — the broker is the source of truth
+    # ==================================================================
+    def _reconcile_loop(self):
+        """
+        Every cycle, ask the broker what is actually open and correct the
+        app's view from it.
+
+        The app's belief about a position is an opinion; the broker's order
+        book and position book are facts. Anything that closes outside the
+        app — an exchange stop firing, a manual square-off, an RMS action —
+        would otherwise leave the app managing a position that no longer
+        exists, and leave the trade log wrong for good.
+        """
+        interval = int(config.STRATEGY.get("reconcile_seconds", 20))
+        while not self._stop.is_set():
+            for _ in range(interval):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+            try:
+                self._reconcile_once()
+            except Exception as e:
+                logger.error(f"Reconciler cycle error: {e}")
+
+    def _reconcile_once(self):
+        book = self.om.fetch_order_book(force=True)
+        positions = self.om.fetch_positions()
+
+        for st in list(self.states.values()):
+            if not st.instrument:
+                continue
+            sym = st.instrument.get("symbol")
+            broker_qty = positions.get(sym) if positions is not None else None
+
+            # ---- (1) the resting stop fired: that IS the exit ----
+            sl_id = self.om.sl_orders.get(st.name)
+            if st.state == S.ENTERED and sl_id:
+                status, avg, fq = self.om.order_fill_detail(sl_id, book)
+                if status in ("complete", "filled"):
+                    lock = self.om.lock_for(st.name)
+                    if lock.acquire(blocking=False):
+                        try:
+                            if st.state == S.ENTERED:
+                                if fq and fq < st.qty:
+                                    logger.critical(
+                                        f"{st.name}: the stop filled only "
+                                        f"{fq} of {st.qty}. The remainder is "
+                                        f"STILL OPEN — check the terminal.")
+                                    st.qty = fq
+                                self.om.reconcile_close(
+                                    st, avg or st.stop_price,
+                                    "TRAIL_HIT" if st.trailed() else "STOP_HIT")
+                                st.state = S.CLOSED
+                                self.om.log_trade(st, self.capital)
+                                self._push_status()
+                        finally:
+                            lock.release()
+                    continue
+
+            # ---- (2) app thinks open, broker is flat: book it ----
+            if st.state == S.ENTERED and broker_qty == 0:
+                lock = self.om.lock_for(st.name)
+                if lock.acquire(blocking=False):
+                    try:
+                        if st.state == S.ENTERED:
+                            px = self._reconcile_exit_price(st, book) or st.ltp
+                            self.om.reconcile_close(st, px,
+                                                    "closed outside the app")
+                            st.state = S.CLOSED
+                            self.om.log_trade(st, self.capital)
+                            self._push_status()
+                    finally:
+                        lock.release()
+                continue
+
+            # ---- (3) app thinks flat, broker holds: an orphan ----
+            if st.state != S.ENTERED and broker_qty:
+                if getattr(st, "_orphan_warned", None) == broker_qty:
+                    continue
+                st._orphan_warned = broker_qty
+                logger.critical(
+                    f"ORPHAN: the broker holds {broker_qty:+d} {sym} that the "
+                    f"app does not have open. No corrective order will be sent "
+                    f"mid-session — CHECK THE TERMINAL NOW. It will be squared "
+                    f"off at 09:30 if it is still there.")
+
+    def _reconcile_exit_price(self, st, book):
+        """The price the broker actually got, not one we assume: the stop's
+        own fill first, then the newest completed closing order on the
+        symbol, then the last tick."""
+        sym = st.instrument.get("symbol")
+        sl_id = self.om.sl_orders.get(st.name)
+        if sl_id:
+            status, avg, _ = self.om.order_fill_detail(sl_id, book)
+            if status in ("complete", "filled") and avg:
+                return avg
+        want = "SELL" if st.is_long else "BUY"
+        best = None
+        for r in book.values():
+            if str(r.get("tradingsymbol")) != sym:
+                continue
+            if str(r.get("transactiontype", "")).upper() != want:
+                continue
+            if str(r.get("status", "")).lower() not in ("complete", "filled"):
+                continue
+            try:
+                px = float(r.get("averageprice") or r.get("price") or 0) or 0.0
+            except (TypeError, ValueError):
+                px = 0.0
+            if px:
+                best = px
+        return best or st.ltp
+
+    # ==================================================================
     # monitor (the clock)
     # ==================================================================
     def _monitor(self):
@@ -630,13 +762,28 @@ class TradingEngine:
                     # One order-book read covers every open position. Polling
                     # each one separately is what tipped the account over
                     # Angel's access-rate limit.
-                    book = self.om.fetch_order_book()
+                    book = self.om.fetch_order_book(force=True)
                     for s in watching:
                         filled, px = self.om.stop_filled(s.name, book)
                         if filled:
                             logger.info(f"{s.name}: resting stop filled at "
                                         f"{px:.2f}; booking it.")
                             s.ltp = px or s.ltp
+                            self._enqueue(("EXIT", s.name,
+                                           "TRAIL_HIT" if s.trailed()
+                                           else "STOP_HIT"))
+                            continue
+                        # Breached but the broker has not confirmed. Give the
+                        # exchange a fair window, then step in.
+                        breach = getattr(s, "stop_breach_at", None)
+                        if breach and (now - breach).total_seconds() > \
+                                float(config.STRATEGY["stop_confirm_seconds"]):
+                            logger.critical(
+                                f"{s.name}: the stop was breached "
+                                f"{int((now - breach).total_seconds())}s ago "
+                                f"and the resting order has still not "
+                                f"confirmed. Taking over the exit.")
+                            s.stop_breach_at = None
                             self._enqueue(("EXIT", s.name,
                                            "TRAIL_HIT" if s.trailed()
                                            else "STOP_HIT"))
@@ -678,11 +825,34 @@ class TradingEngine:
         ours = {s.instrument.get("symbol") for s in self.states.values()
                 if s.instrument}
         live = {sym: q for sym, q in pos.items() if q and sym in ours}
-        if live:
-            logger.critical(f"!!! BROKER STILL SHOWS OPEN QUANTITY: {live}. "
+        if not live:
+            logger.info("Broker positions confirm flat.")
+            return
+
+        logger.critical(f"!!! BROKER STILL SHOWS OPEN QUANTITY: {live} !!!")
+        # This runs only after the 09:30 sweep, where flat is a hard rule of
+        # the strategy. Mid-session orphans are handled by the reconciler,
+        # which reports and re-checks but never sends an order of its own.
+        if not config.STRATEGY.get("auto_fix_stray", True):
+            logger.critical("Auto-correction is off — SQUARE OFF MANUALLY NOW.")
+            return
+
+        by_symbol = {s.instrument.get("symbol"): s
+                     for s in self.states.values() if s.instrument}
+        for sym, qty in live.items():
+            st = by_symbol.get(sym)
+            if st is None:
+                continue
+            self.om.square_off_stray(sym, st.instrument.get("token"),
+                                     st.instrument.get("exchange", "NSE"), qty)
+
+        pos = self.om.fetch_positions()
+        still = {s: q for s, q in (pos or {}).items() if q and s in ours}
+        if still:
+            logger.critical(f"!!! STILL NOT FLAT AFTER CORRECTION: {still}. "
                             f"SQUARE OFF MANUALLY NOW. !!!")
         else:
-            logger.info("Broker positions confirm flat.")
+            logger.info("Stray position corrected — broker confirms flat.")
 
     def _wait_flat(self, timeout=25):
         deadline = time.time() + timeout

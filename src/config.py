@@ -98,6 +98,20 @@ STRATEGY = {
     # ---- plumbing ----
     "preopen_source":   "ANGEL_THEN_NSE",  # ANGEL | NSE | ANGEL_THEN_NSE
     "place_exchange_sl": True,        # resting SL with the broker
+    # When a stop rests at the exchange it IS the exit. The engine must not
+    # send its own market order on the same breach or the two race and the
+    # position is closed twice — once flat, once reversed. The engine only
+    # steps in if the broker has not confirmed the fill within this many
+    # seconds of the price breaching the stop.
+    "stop_confirm_seconds": 20,
+    # If the broker still shows quantity after the 09:30 sweep, send one
+    # corrective order rather than leaving a stray position open. Mid-session
+    # orphans are never corrected with an order — they are re-protected and
+    # reported, because a naked market order against a position the app does
+    # not understand is how a mistake gets doubled.
+    "auto_fix_stray": True,
+    # How often the reconciler asks the broker what is actually open.
+    "reconcile_seconds": 20,
     "paper_slippage_pct": 0.05,       # each side, PAPER mode only
 }
 

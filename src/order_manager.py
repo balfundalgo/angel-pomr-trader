@@ -319,16 +319,43 @@ class OrderManager:
             return True, price
         return False, 0.0
 
-    def cancel_stop(self, name):
+    def cancel_stop(self, name) -> tuple[str, float]:
+        """
+        Cancel the resting stop and CONFIRM what happened.
+
+        Returns ("cancelled"|"filled"|"failed"|"none", fill_price).
+
+        A cancel request that does not raise is not proof of anything. An
+        order that has already triggered cannot be cancelled, and treating
+        the silent "success" as a cancellation is exactly how a position gets
+        sold twice — once by the exchange stop and once by the market order
+        that follows.
+        """
         oid = self.sl_orders.pop(name, None)
         if not oid or config.TRADING_MODE != "LIVE":
-            return
+            return "none", 0.0
         try:
             api_rate_limiter.wait("cancelOrder")
             config.SMART.cancelOrder(oid, "STOPLOSS")
-            logger.info(f"{name}: cancelled resting stop {oid}")
         except Exception as e:
-            logger.error(f"{name}: cancel stop {oid} failed: {e}")
+            logger.error(f"{name}: cancel stop {oid} raised: {e}")
+
+        status, px, _ = self._order_status(oid, self.fetch_order_book(force=True))
+        if status in ("complete", "filled"):
+            logger.warning(f"{name}: the resting stop had ALREADY FILLED at "
+                           f"{px:.2f} — it could not be cancelled. No exit "
+                           f"order will be sent.")
+            return "filled", px
+        if status in ("cancelled", "rejected"):
+            logger.info(f"{name}: resting stop {oid} cancelled.")
+            return "cancelled", 0.0
+        if status is None:
+            logger.warning(f"{name}: could not read stop {oid} back after "
+                           f"cancelling — treating as NOT cancelled.")
+            return "failed", 0.0
+        logger.warning(f"{name}: stop {oid} still shows '{status}' after the "
+                       f"cancel request.")
+        return "failed", 0.0
 
     # ------------------------------------------------------------------
     # exit
@@ -349,7 +376,10 @@ class OrderManager:
         side = "SELL" if st.is_long else "BUY"
 
         if config.TRADING_MODE == "LIVE":
-            filled, fill_px = self.stop_filled(st.name)
+            # Forced, uncached read: the cached book is up to two seconds old
+            # and a stop that has just triggered will not be in it.
+            filled, fill_px = self.stop_filled(st.name,
+                                               self.fetch_order_book(force=True))
             if filled:
                 self.sl_orders.pop(st.name, None)
                 logger.info(f"{st.name}: resting stop had already filled at "
@@ -358,7 +388,20 @@ class OrderManager:
                                 "STOPLOSS_LIMIT", status="COMPLETE",
                                 detail="resting stop filled")
                 return fill_px, ("TRAIL_HIT" if st.trailed() else "STOP_HIT"), True
-            self.cancel_stop(st.name)
+            outcome, cancel_px = self.cancel_stop(st.name)
+            if outcome == "filled":
+                # The exchange stop beat us to it between the check above and
+                # the cancel. That is the exit — do NOT send another order.
+                self._log_order(st.name, inst, side, qty, cancel_px,
+                                "STOPLOSS_LIMIT", status="COMPLETE",
+                                detail="resting stop filled during cancel")
+                return cancel_px, ("TRAIL_HIT" if st.trailed() else "STOP_HIT"), True
+            if outcome == "failed":
+                logger.critical(f"{st.name}: the resting stop could not be "
+                                f"confirmed cancelled. Sending a market exit "
+                                f"now could close the position TWICE. Holding "
+                                f"off — CHECK THE TERMINAL.")
+                return 0.0, reason, False
 
             oid = self._send(self._market_params(inst, qty, side),
                              f"EXIT {side} {qty} {inst['symbol']} ({reason})",
@@ -537,6 +580,35 @@ class OrderManager:
             # Serve the last good copy rather than pretending the book is empty
             return self._book_cache if self._book_cache is not None else {}
 
+    def square_off_stray(self, symbol: str, token: str, exchange: str,
+                         netqty: int) -> bool:
+        """One corrective market order against a position the broker shows and
+        the app does not expect. Used only after the 09:30 sweep."""
+        if config.TRADING_MODE != "LIVE" or not netqty:
+            return False
+        side = "SELL" if netqty > 0 else "BUY"
+        qty = abs(int(netqty))
+        inst = {"symbol": symbol, "token": token, "exchange": exchange,
+                "kind": "STOCK"}
+        logger.critical(f"CORRECTING STRAY POSITION: {side} {qty} {symbol} "
+                        f"(broker shows {netqty:+d}).")
+        oid = self._send(self._market_params(inst, qty, side),
+                         f"STRAY FIX {side} {qty} {symbol}")
+        self._log_order(symbol, inst, side, qty, 0.0, "MARKET",
+                        order_id=oid or "", status="SUBMITTED",
+                        detail="stray position correction")
+        ok, fill, detail = self._verify(oid, f"STRAY FIX {symbol}")
+        self._log_order(symbol, inst, side, qty, fill, "MARKET",
+                        order_id=oid or "",
+                        status="COMPLETE" if ok else "FAILED",
+                        detail=f"stray correction; {detail}")
+        if ok:
+            logger.critical(f"Stray {symbol} squared off at {fill:.2f}.")
+        else:
+            logger.critical(f"!!! STRAY {symbol} COULD NOT BE SQUARED OFF. "
+                            f"DO IT MANUALLY NOW. !!!")
+        return ok
+
     def fetch_positions(self) -> dict | None:
         """{tradingsymbol: netqty} from the broker, or None if unreadable.
         Used to prove we are actually flat after the 09:30 square-off."""
@@ -587,6 +659,49 @@ class OrderManager:
                     return True
             time.sleep(0.5)
         return False
+
+    def order_fill_detail(self, order_id, book=None):
+        """(status_lower, avg_price, filled_qty) for an order.
+
+        Filled quantity matters: a market order can come back part-filled,
+        and treating that as a clean fill leaves the remainder unmanaged.
+        """
+        if book is None:
+            book = self.fetch_order_book()
+        row = book.get(str(order_id))
+        if not row:
+            return None, 0.0, 0
+        status = str(row.get("status", "")).lower()
+        try:
+            avg = float(row.get("averageprice") or row.get("price") or 0) or 0.0
+        except (TypeError, ValueError):
+            avg = 0.0
+        try:
+            fq = int(float(row.get("filledshares") or row.get("quantity") or 0) or 0)
+        except (TypeError, ValueError):
+            fq = 0
+        return status, avg, fq
+
+    def reconcile_close(self, st, exit_price: float, reason: str):
+        """
+        Record an exit the BROKER already executed. No order is placed.
+
+        Also kills any lingering resting stop: a protective order left alive
+        after the position is gone will, if it triggers, open a brand new
+        position in the opposite direction.
+        """
+        self.cancel_stop(st.name)
+        st.exit_price = float(exit_price)
+        st.exit_time = datetime.now()
+        st.exit_reason = reason
+        if st.instrument.get("kind") == "OPTION" or st.is_long:
+            st.pnl = (st.exit_price - st.entry_price) * st.qty
+        else:
+            st.pnl = (st.entry_price - st.exit_price) * st.qty
+        self.realized += st.pnl
+        logger.critical(f"RECONCILED {st.name}: the broker closed {st.qty} @ "
+                        f"{st.exit_price:.2f} while the app still had it open. "
+                        f"P&L Rs {st.pnl:,.2f} corrected. [{reason}]")
 
     def _order_status(self, order_id, book=None):
         """(status_lower, avg_price, text) for an order id, off the shared
