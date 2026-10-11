@@ -32,6 +32,7 @@ import config
 from logger import logger
 from api_rate_limiter import api_rate_limiter
 from angel_data import round_to_tick
+from order_book import watcher
 import cautionary
 
 _ORDER_COLS = ["time", "mode", "name", "instrument", "symbol", "side",
@@ -191,14 +192,27 @@ class OrderManager:
         self._log_order(st.name, inst, side, qty, trig, "STOPLOSS_LIMIT",
                         order_id=oid or "",
                         status="RESTING" if oid else "FAILED")
-        if oid and self._verify_sl_rests(oid, trig):
+        if oid:
+            # ALWAYS track an order the broker accepted, verified or not. A
+            # stop we cannot read back is not a stop that does not exist — it
+            # is usually a stop we could not read because the order book was
+            # rate limited. Forgetting it makes the engine believe the
+            # position is unprotected, and it then sends its own exit on top
+            # of a stop that is quietly still live.
             self.sl_orders[st.name] = oid
+        state = self._verify_sl_rests(oid, trig) if oid else "absent"
+        if state == "resting":
             st.stop_sent = trig
             logger.info(f"{st.name}: protective stop resting at {trig:.2f} "
                         f"(limit {limit:.2f}), id={oid} — verified at exchange")
-        elif oid:
-            # Placed but not resting. A dead order is not protection.
-            logger.critical(f"{st.name}: protective stop {oid} did NOT rest at "
+        elif state == "unknown":
+            st.stop_sent = trig
+            logger.warning(f"{st.name}: protective stop {oid} was accepted at "
+                           f"{trig:.2f} but could not be read back (the order "
+                           f"book is unavailable). Treating it as LIVE.")
+        elif state == "gone":
+            self.sl_orders.pop(st.name, None)
+            logger.critical(f"{st.name}: protective stop {oid} is NOT live at "
                             f"{trig:.2f} — position UNPROTECTED at the broker, "
                             f"CHECK THE TERMINAL. The engine stop is the only "
                             f"cover.")
@@ -248,7 +262,18 @@ class OrderManager:
                 config.SMART.modifyOrder(params)
                 # A returning call is not proof the exchange took it. Read it
                 # back before believing the stop has moved.
-                if self._verify_sl_rests(oid, trig):
+                state = self._verify_sl_rests(oid, trig)
+                if state == "filled":
+                    logger.warning(f"{st.name}: the stop filled while the "
+                                   f"trail was being applied — nothing to "
+                                   f"move.")
+                    return True
+                if state == "unknown":
+                    logger.warning(f"{st.name}: could not read the stop back "
+                                   f"after modifying (order book unavailable). "
+                                   f"Leaving it alone rather than replacing it.")
+                    return True
+                if state == "resting":
                     st.stop_sent = trig
                     self._log_order(st.name, inst,
                                     "SELL" if st.is_long else "BUY", qty, trig,
@@ -279,9 +304,25 @@ class OrderManager:
         return False
 
     def _replace_stop(self, st, inst, qty, trig, limit) -> bool:
-        """Cancel the tracked stop and place a fresh one at the wanted trigger,
-        then verify. Used only when a modify silently fails."""
-        self.cancel_stop(st.name)
+        """Cancel the tracked stop and place a fresh one at the wanted trigger.
+
+        The cancel outcome DECIDES whether a replacement is placed at all. If
+        the old stop already filled, the position is gone and a fresh stop
+        would simply open a new one in the opposite direction.
+        """
+        outcome, fill_px = self.cancel_stop(st.name)
+        if outcome == "filled":
+            st.stop_filled_px = fill_px
+            logger.warning(f"{st.name}: the stop filled at {fill_px:.2f} while "
+                           f"the trail was being applied. The position is "
+                           f"closed — no replacement stop will be placed.")
+            return False
+        if outcome == "failed":
+            logger.critical(f"{st.name}: could not confirm the old stop was "
+                            f"cancelled. Placing another one could leave TWO "
+                            f"live stops on one position — not replacing. "
+                            f"CHECK THE TERMINAL.")
+            return False
         oid = self._send({
             "variety": "STOPLOSS",
             "tradingsymbol": inst["symbol"],
@@ -295,14 +336,12 @@ class OrderManager:
             "triggerprice": f"{trig:.2f}",
             "quantity": str(qty),
         }, f"REPLACE STOP {inst['symbol']} @ {trig}")
-        if oid and self._verify_sl_rests(oid, trig):
-            self.sl_orders[st.name] = oid
-            st.stop_sent = trig
-            logger.info(f"{st.name}: stop replaced -> id {oid} @ {trig:.2f} "
-                        f"(verified)")
-            return True
         if oid:
             self.sl_orders[st.name] = oid
+        if oid and self._verify_sl_rests(oid, trig) in ("resting", "unknown"):
+            st.stop_sent = trig
+            logger.info(f"{st.name}: stop replaced -> id {oid} @ {trig:.2f}")
+            return True
         logger.critical(f"{st.name}: could not re-establish the resting stop at "
                         f"{trig:.2f} — position may be UNPROTECTED at the "
                         f"broker, CHECK THE TERMINAL.")
@@ -334,13 +373,22 @@ class OrderManager:
         oid = self.sl_orders.pop(name, None)
         if not oid or config.TRADING_MODE != "LIVE":
             return "none", 0.0
+        marker = watcher.marker()
         try:
             api_rate_limiter.wait("cancelOrder")
             config.SMART.cancelOrder(oid, "STOPLOSS")
         except Exception as e:
             logger.error(f"{name}: cancel stop {oid} raised: {e}")
 
-        status, px, _ = self._order_status(oid, self.fetch_order_book(force=True))
+        book = watcher.fresh_after(marker, timeout=6.0)
+        if book is None:
+            logger.critical(f"{name}: could not confirm what happened to stop "
+                            f"{oid} — the order book is unavailable. Treating "
+                            f"it as UNRESOLVED; no order will be sent against "
+                            f"this position.")
+            self.sl_orders[name] = oid      # keep tracking it
+            return "failed", 0.0
+        status, px, _ = self._order_status(oid, book)
         if status in ("complete", "filled"):
             logger.warning(f"{name}: the resting stop had ALREADY FILLED at "
                            f"{px:.2f} — it could not be cancelled. No exit "
@@ -467,6 +515,8 @@ class OrderManager:
         for attempt in range(config.RETRY["max_retries"]):
             try:
                 api_rate_limiter.wait("placeOrder")
+                # Evidence must post-date the action, so mark the clock first.
+                self._last_marker = watcher.marker()
                 oid, detail = self._submit(params)
                 if oid and len(str(oid)) > 4:
                     logger.info(f"Order submitted [{label}] id={oid}")
@@ -551,34 +601,17 @@ class OrderManager:
     _BOOK_TTL = 2.0
 
     def fetch_order_book(self, force: bool = False) -> dict:
-        """{orderid: row}, cached for a couple of seconds."""
-        now = time.time()
-        if (not force) and self._book_cache is not None \
-                and (now - self._book_at) < self._BOOK_TTL:
-            return self._book_cache
-        try:
-            api_rate_limiter.wait("orderBook")
-            resp = config.SMART.orderBook()
-            book = {str(r.get("orderid")): r
-                    for r in (resp or {}).get("data", []) or []}
-            self._book_cache, self._book_at = book, now
-            self._book_fails = 0
-            return book
-        except Exception as e:
-            msg = str(e)
-            self._book_fails += 1
-            if "access rate" in msg.lower() or "exceeding" in msg.lower():
-                # Back off rather than hammering a door that is already shut.
-                api_rate_limiter.penalise("orderBook", 2.0)
-                if self._book_fails in (1, 5, 20):
-                    logger.warning(f"Order book is rate limited by the broker "
-                                   f"(failure {self._book_fails}); backing off. "
-                                   f"Stops resting at the exchange are "
-                                   f"unaffected.")
-            else:
-                logger.error(f"orderBook fetch failed: {e}")
-            # Serve the last good copy rather than pretending the book is empty
-            return self._book_cache if self._book_cache is not None else {}
+        """
+        The shared snapshot. This makes NO API call of its own — the watcher
+        thread is the only reader, so the cost of the order book is one fixed
+        rate for the whole app rather than something that grows with the
+        number of orders in flight.
+        """
+        book, age, ok = watcher.current()
+        if not ok and age > 15:
+            logger.warning(f"Order book snapshot is {age:.0f}s old — treating "
+                           f"its contents as unconfirmed.")
+        return book
 
     def square_off_stray(self, symbol: str, token: str, exchange: str,
                          netqty: int) -> bool:
@@ -635,7 +668,7 @@ class OrderManager:
                 return None
         return None
 
-    def _verify_sl_rests(self, oid, want_trigger, tries=3) -> bool:
+    def _verify_sl_rests(self, oid, want_trigger, tries=2) -> str:
         """
         Confirm the order is a LIVE resting stop whose trigger at the exchange
         is the one we intended.
@@ -645,20 +678,30 @@ class OrderManager:
         in both cases the position is unprotected while the app believes it
         is covered.
         """
+        readable = False
+        marker = getattr(self, "_last_marker", None) or watcher.marker()
         for _ in range(tries):
-            row = self.fetch_order_book(force=True).get(str(oid))
+            book = watcher.fresh_after(marker, timeout=5.0)
+            if book is None:
+                break
+            marker = time.monotonic()
+            readable = True
+            row = book.get(str(oid))
             if row:
                 status = str(row.get("status", "")).lower()
-                if status in ("cancelled", "rejected", "complete", "filled"):
-                    return False
+                if status in ("cancelled", "rejected"):
+                    return "gone"
+                if status in ("complete", "filled"):
+                    return "filled"
                 try:
                     got = float(row.get("triggerprice") or 0)
                 except (TypeError, ValueError):
                     got = 0.0
                 if abs(got - round(float(want_trigger), 2)) < 0.06:
-                    return True
-            time.sleep(0.5)
-        return False
+                    return "resting"
+        # Could not read the book at all -> we know nothing, which is NOT the
+        # same as knowing the order is dead.
+        return "gone" if readable else "unknown"
 
     def order_fill_detail(self, order_id, book=None):
         """(status_lower, avg_price, filled_qty) for an order.
@@ -726,12 +769,16 @@ class OrderManager:
         """
         if not order_id:
             return False, 0.0, "no order id returned"
-        for _ in range(6):
-            status, px, text = self._order_status(order_id,
-                                                  self.fetch_order_book(force=True))
-            if status is None:
-                time.sleep(0.8)
-                continue
+        marker = getattr(self, "_last_marker", None) or watcher.marker()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            book = watcher.fresh_after(marker, timeout=deadline - time.monotonic())
+            if book is None:
+                # No snapshot newer than the order was published in time. We
+                # do not know the outcome — say so rather than guessing.
+                return False, 0.0, "order book unavailable; outcome unknown"
+            marker = time.monotonic()
+            status, px, text = self._order_status(order_id, book)
             if status in ("complete", "filled"):
                 logger.info(f"FILL CONFIRMED [{label}] id={order_id} @ {px:.2f}")
                 return True, px, "complete"
@@ -739,7 +786,6 @@ class OrderManager:
                 logger.critical(f"ORDER {status.upper()} [{label}] "
                                 f"id={order_id} reason: {text}")
                 return False, 0.0, f"{status}: {text}"
-            time.sleep(0.8)
         return False, 0.0, "not confirmed within timeout"
 
     def summary(self):

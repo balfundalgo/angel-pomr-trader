@@ -31,6 +31,7 @@ from angel_connection import connection_manager
 from angel_websocket import WebSocketFeed
 from order_manager import OrderManager
 from api_rate_limiter import api_rate_limiter
+from order_book import watcher
 import angel_data
 import scanner
 import strategy as S
@@ -67,6 +68,7 @@ class TradingEngine:
     def stop(self):
         logger.info("Stop requested.")
         self._stop.set()
+        watcher.stop()
         if self.feed:
             self.feed.stop()
 
@@ -81,6 +83,10 @@ class TradingEngine:
 
             self._read_capital()
             self._preflight()
+            if config.TRADING_MODE == "LIVE":
+                watcher.interval = float(config.STRATEGY.get("orderbook_interval", 1.5))
+                watcher.start()
+                self._session_start = time.monotonic()
 
             self._phase("universe")
             if not angel_data.download_scrip_master():
@@ -540,6 +546,14 @@ class TradingEngine:
         can never be sent against a position that is being closed."""
         if st.state != S.ENTERED:
             return
+        # If the stop has already been breached, or an exit is queued, the
+        # position is on its way out. Modifying its stop now is pointless and
+        # actively dangerous: the modify path can place a replacement order
+        # after the original has filled.
+        if getattr(st, "stop_breach_at", None) or getattr(st, "_pending_EXIT", False):
+            logger.info(f"{st.name}: trail abandoned — the position is already "
+                        f"exiting.")
+            return
         inst = st.instrument
         if inst.get("kind") == "OPTION":
             # The stop is a stock price level, so there is nothing resting at
@@ -623,7 +637,7 @@ class TradingEngine:
                 logger.error(f"Reconciler cycle error: {e}")
 
     def _reconcile_once(self):
-        book = self.om.fetch_order_book(force=True)
+        book = self.om.fetch_order_book()
         positions = self.om.fetch_positions()
 
         for st in list(self.states.values()):
@@ -762,12 +776,14 @@ class TradingEngine:
                     # One order-book read covers every open position. Polling
                     # each one separately is what tipped the account over
                     # Angel's access-rate limit.
-                    book = self.om.fetch_order_book(force=True)
+                    book = self.om.fetch_order_book()
                     for s in watching:
                         filled, px = self.om.stop_filled(s.name, book)
                         if filled:
-                            logger.info(f"{s.name}: resting stop filled at "
-                                        f"{px:.2f}; booking it.")
+                            if not getattr(s, "_fill_announced", False):
+                                s._fill_announced = True
+                                logger.info(f"{s.name}: resting stop filled at "
+                                            f"{px:.2f}; booking it.")
                             s.ltp = px or s.ltp
                             self._enqueue(("EXIT", s.name,
                                            "TRAIL_HIT" if s.trailed()
@@ -776,17 +792,29 @@ class TradingEngine:
                         # Breached but the broker has not confirmed. Give the
                         # exchange a fair window, then step in.
                         breach = getattr(s, "stop_breach_at", None)
-                        if breach and (now - breach).total_seconds() > \
+                        if not breach or s.state != S.ENTERED:
+                            continue
+                        if (now - breach).total_seconds() <= \
                                 float(config.STRATEGY["stop_confirm_seconds"]):
-                            logger.critical(
-                                f"{s.name}: the stop was breached "
-                                f"{int((now - breach).total_seconds())}s ago "
-                                f"and the resting order has still not "
-                                f"confirmed. Taking over the exit.")
-                            s.stop_breach_at = None
-                            self._enqueue(("EXIT", s.name,
-                                           "TRAIL_HIT" if s.trailed()
-                                           else "STOP_HIT"))
+                            continue
+                        if not book:
+                            # We cannot see the order book, so we do not know
+                            # the stop has not filled. Taking over on a guess
+                            # is how a position gets closed twice.
+                            logger.warning(
+                                f"{s.name}: stop breached and the order book "
+                                f"is unreadable. NOT taking over — the resting "
+                                f"stop is the safer assumption.")
+                            continue
+                        logger.critical(
+                            f"{s.name}: the stop was breached "
+                            f"{int((now - breach).total_seconds())}s ago and "
+                            f"the resting order shows unfilled. Taking over "
+                            f"the exit.")
+                        s.stop_breach_at = None
+                        self._enqueue(("EXIT", s.name,
+                                       "TRAIL_HIT" if s.trailed()
+                                       else "STOP_HIT"))
 
             # ---- 09:30, win or lose ----
             if now >= config.square_off_dt():
@@ -879,12 +907,16 @@ class TradingEngine:
         for s in self.states.values():
             logger.info(f"  {s.name:<14} {s.side:<7} {s.state:<13} "
                         f"{s.note}")
+        if config.TRADING_MODE == "LIVE":
+            watcher.report(time.monotonic() - getattr(self, "_session_start",
+                                                      time.monotonic()))
         logger.info(f"Trade log:  {config.trades_file()}")
         logger.info(f"Order log:  {config.orders_file()}")
         logger.info(f"Watchlist:  {config.scan_file()}")
         logger.info("=" * 62)
         self.phase = "done"
         self._push_status()
+        watcher.stop()
         if self.feed:
             self.feed.stop()
 
