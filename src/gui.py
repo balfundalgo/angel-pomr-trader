@@ -17,6 +17,7 @@ from tkinter import ttk
 import customtkinter as ctk
 
 import config
+import single_instance
 from logger import logger, set_gui_sink
 from engine import TradingEngine
 
@@ -56,6 +57,7 @@ class App(ctk.CTk):
         config.load_settings()
         self._build()
         set_gui_sink(self._log_line)
+        self._solo = single_instance.warn_if_duplicate()
         logger.info(f"{config.APP_NAME} v{config.APP_VERSION} ready.")
         logger.info("Pre-Open Momentum Reclaim — flat by 09:30 every day.")
         self._tick_clock()
@@ -445,6 +447,12 @@ class App(ctk.CTk):
             logger.error("Could not write settings.json")
 
     def _start(self):
+        if not getattr(self, "_solo", True):
+            if not single_instance.acquire():
+                logger.critical("Refusing to start: another copy of this app "
+                                "is running. Close it first.")
+                return
+            self._solo = True
         try:
             self._collect()
         except ValueError as e:

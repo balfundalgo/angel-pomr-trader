@@ -83,10 +83,10 @@ class TradingEngine:
 
             self._read_capital()
             self._preflight()
-            if config.TRADING_MODE == "LIVE":
-                watcher.interval = float(config.STRATEGY.get("orderbook_interval", 1.5))
-                watcher.start()
-                self._session_start = time.monotonic()
+            # The watcher is NOT started here. There is nothing to watch for
+            # the hour between connecting and the open, and reading the order
+            # book through that window is pure API spend. It starts with the
+            # feed and stops at 09:30.
 
             self._phase("universe")
             if not angel_data.download_scrip_master():
@@ -140,6 +140,10 @@ class TradingEngine:
                 return
 
             self._phase("connecting feed")
+            if config.TRADING_MODE == "LIVE":
+                watcher.interval = float(config.STRATEGY.get("orderbook_interval", 1.5))
+                watcher.start()
+                self._session_start = time.monotonic()
             self.feed = WebSocketFeed(self._on_tick)
             for st in self.states.values():
                 self.feed.add_token(st.token, "NSE")
@@ -366,6 +370,10 @@ class TradingEngine:
     def _do_entry(self, st):
         if st.state != S.TESTED or self.halted:
             return
+        # Verification is about to need the order book.
+        if config.TRADING_MODE == "LIVE":
+            watcher.set_demand(max(1, sum(1 for x in self.states.values()
+                                          if x.state == S.ENTERED) + 1))
         now = datetime.now()
         if now > config.last_entry_dt():
             st.state = S.MISSED
@@ -827,6 +835,11 @@ class TradingEngine:
                 self._end_of_day()
                 return
 
+            if config.TRADING_MODE == "LIVE":
+                open_now = sum(1 for x in self.states.values()
+                               if x.state == S.ENTERED)
+                watcher.set_demand(open_now)
+
             if time.time() - last_status > 1.0:
                 last_status = time.time()
                 self._push_status()
@@ -916,6 +929,10 @@ class TradingEngine:
         logger.info("=" * 62)
         self.phase = "done"
         self._push_status()
+        # Stop EVERY background thread. Without this the reconciler keeps
+        # polling the order book and the position endpoint indefinitely after
+        # the session has finished — long after there is anything to reconcile.
+        self._stop.set()
         watcher.stop()
         if self.feed:
             self.feed.stop()

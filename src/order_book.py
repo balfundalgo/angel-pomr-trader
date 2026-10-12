@@ -45,6 +45,7 @@ class OrderBookWatcher:
         self._lock = threading.Condition()
         self._stop = threading.Event()
         self._thread = None
+        self._demand = 0        # how many things actually need watching
 
     # ------------------------------------------------------------------
     def start(self):
@@ -63,8 +64,25 @@ class OrderBookWatcher:
             self._lock.notify_all()
 
     # ------------------------------------------------------------------
+    def set_demand(self, n: int):
+        """How many open positions / unresolved orders there are right now.
+
+        At zero the watcher stops calling altogether. Angel's documented
+        getOrderBook limit is one request per second, but refusals happen well
+        below that in practice, so the only reliable way to stay inside it is
+        to not ask when there is nothing to ask about. Most of a POMR session
+        has nothing open.
+        """
+        with self._lock:
+            self._demand = max(0, int(n))
+
     def _run(self):
         while not self._stop.is_set():
+            with self._lock:
+                idle = self._demand <= 0
+            if idle:
+                self._stop.wait(1.0)
+                continue
             started = time.monotonic()
             self._read_once()
             elapsed = time.monotonic() - started

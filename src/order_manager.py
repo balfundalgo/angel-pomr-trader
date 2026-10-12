@@ -52,6 +52,7 @@ class OrderManager:
         self.realized = 0.0
         self.trades = []                 # completed round trips
         self.sl_orders = {}              # name -> resting SL order id
+        self.unique_ids = {}             # orderid -> uniqueorderid
         self._book_cache = None          # shared order-book snapshot
         self._book_at = 0.0
         self._book_fails = 0
@@ -353,6 +354,10 @@ class OrderManager:
         oid = self.sl_orders.get(name)
         if not oid or config.TRADING_MODE != "LIVE":
             return False, 0.0
+        direct = self.status_direct(oid)
+        if direct is not None:
+            status, price, _ = direct
+            return (status in ("complete", "filled")), price
         status, price, _ = self._order_status(oid, book)
         if status in ("complete", "filled"):
             return True, price
@@ -519,6 +524,10 @@ class OrderManager:
                 self._last_marker = watcher.marker()
                 oid, detail = self._submit(params)
                 if oid and len(str(oid)) > 4:
+                    pend = getattr(OrderManager, "_pending_unique", None)
+                    if pend and pend[0] == str(oid):
+                        self.unique_ids[str(oid)] = pend[1]
+                    OrderManager._pending_unique = None
                     logger.info(f"Order submitted [{label}] id={oid}")
                     return str(oid)
                 logger.error(f"Order refused [{label}] attempt {attempt+1}: "
@@ -543,7 +552,10 @@ class OrderManager:
             resp = full(params) or {}
             data = resp.get("data") or {}
             oid = data.get("orderid") or data.get("uniqueorderid")
+            uid = data.get("uniqueorderid")
             if oid:
+                if uid:
+                    OrderManager._pending_unique = (str(oid), str(uid))
                 return str(oid), ""
             bits = [str(resp.get("message") or "").strip(),
                     str(resp.get("errorcode") or "").strip()]
@@ -609,8 +621,11 @@ class OrderManager:
         """
         book, age, ok = watcher.current()
         if not ok and age > 15:
-            logger.warning(f"Order book snapshot is {age:.0f}s old — treating "
-                           f"its contents as unconfirmed.")
+            last = getattr(self, "_stale_warned_at", 0.0)
+            if time.time() - last > 60:
+                self._stale_warned_at = time.time()
+                logger.warning(f"Order book snapshot is {age:.0f}s old — "
+                               f"treating its contents as unconfirmed.")
         return book
 
     def square_off_stray(self, symbol: str, token: str, exchange: str,
@@ -702,6 +717,43 @@ class OrderManager:
         # Could not read the book at all -> we know nothing, which is NOT the
         # same as knowing the order is dead.
         return "gone" if readable else "unknown"
+
+    def status_direct(self, order_id):
+        """
+        Ask about ONE order using Angel's individual-order-status endpoint,
+        which allows 10 requests/second — against getOrderBook's 1/second.
+        It is the endpoint Angel added specifically for order monitoring.
+
+        Returns (status, avg_price, filled_qty) or None when unavailable, in
+        which case the caller falls back to the shared order-book snapshot.
+        """
+        uid = self.unique_ids.get(str(order_id))
+        if not uid:
+            return None
+        for meth in ("individual_order_details", "getIndividualOrderDetails",
+                     "individualOrderDetails"):
+            fn = getattr(config.SMART, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                api_rate_limiter.wait("orderStatus")
+                resp = fn(uid) or {}
+                d = resp.get("data") or {}
+                if not d:
+                    return None
+                try:
+                    avg = float(d.get("averageprice") or d.get("price") or 0) or 0.0
+                except (TypeError, ValueError):
+                    avg = 0.0
+                try:
+                    fq = int(float(d.get("filledshares") or 0) or 0)
+                except (TypeError, ValueError):
+                    fq = 0
+                return str(d.get("status", "")).lower(), avg, fq
+            except Exception as e:
+                logger.debug(f"individual order status via {meth} failed: {e}")
+                return None
+        return None
 
     def order_fill_detail(self, order_id, book=None):
         """(status_lower, avg_price, filled_qty) for an order.

@@ -103,6 +103,9 @@ class EndpointRateLimiter:
             # Angel refuses well before a strict 1/sec in practice, and the
             # order book is polled continuously while positions are open.
             "orderBook": 1.60,
+            # Angel's individual-order-status endpoint allows 10/sec; keep a
+            # comfortable margin rather than using the whole allowance.
+            "orderStatus": 0.25,
             "tradeBook": 1.05,
             "position": 1.05,
             # Orders: keep separate and fast
