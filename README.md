@@ -183,6 +183,49 @@ whose single lot risks more than the budget falls back to the cash short.
 
 ---
 
+## Staying inside Angel's rate limits
+
+Angel publishes a limit per endpoint, per client code, and two lines in that
+table decide the whole design:
+
+| Endpoint | Limit | How it is used here |
+|---|---|---|
+| `order/v1/details/{id}` | 10/sec, 500/min | every order status check |
+| `getOrderBook` | **1/sec** | reconciler and fallback only |
+| `getPosition` | 1/sec | truth check every 3s |
+| place + modify + cancel | **9/sec CUMULATIVE** | one shared bucket |
+| `quote` | 10/sec, 500/min | 5 calls at the 09:08 scan |
+
+The per-order endpoint allows ten times what the order book does, so
+anything that needs watching goes through it. The order book — the most
+restricted endpoint Angel offers — is touched only when something genuinely
+needs the whole book.
+
+Place, modify and cancel are counted **together**. Three separate buckets
+would sit inside every individual limit and still be refused, so they share
+one allowance here.
+
+Polling cadence is driven by price, not by a timer: a stop far from the
+market is checked every 10 seconds, one within 0.2% every second, and one
+the market has already reached every half second until it resolves. Four
+quiet positions therefore cost 0.4 calls/sec, and the expensive case is
+exactly the case that matters.
+
+Every bucket also keeps rolling per-minute and per-hour windows, and only
+80% of each published allowance is ever spent.
+
+## Surviving a restart
+
+Open positions are written to `data/open_positions.json` on every change,
+atomically. On startup the file is read back and checked against the
+broker's own position book: anything still held is adopted, re-armed with
+its stop, and squared off at 09:30 with everything else. Entries from a
+previous day are ignored.
+
+This covers the one orphan source no API design can reach — the app not
+running. A crash, a reboot, or the operator pressing Stop mid-session no
+longer leaves a position with nobody watching it.
+
 ## Tests
 
 ```bash

@@ -31,7 +31,7 @@ from angel_connection import connection_manager
 from angel_websocket import WebSocketFeed
 from order_manager import OrderManager
 from api_rate_limiter import api_rate_limiter
-from order_book import watcher
+import position_store
 import angel_data
 import scanner
 import strategy as S
@@ -68,7 +68,7 @@ class TradingEngine:
     def stop(self):
         logger.info("Stop requested.")
         self._stop.set()
-        watcher.stop()
+        position_store.clear()
         if self.feed:
             self.feed.stop()
 
@@ -83,6 +83,7 @@ class TradingEngine:
 
             self._read_capital()
             self._preflight()
+            self._recover_positions()
             # The watcher is NOT started here. There is nothing to watch for
             # the hour between connecting and the open, and reading the order
             # book through that window is pure API spend. It starts with the
@@ -140,10 +141,7 @@ class TradingEngine:
                 return
 
             self._phase("connecting feed")
-            if config.TRADING_MODE == "LIVE":
-                watcher.interval = float(config.STRATEGY.get("orderbook_interval", 1.5))
-                watcher.start()
-                self._session_start = time.monotonic()
+            self._session_start = time.monotonic()
             self.feed = WebSocketFeed(self._on_tick)
             for st in self.states.values():
                 self.feed.add_token(st.token, "NSE")
@@ -219,6 +217,62 @@ class TradingEngine:
                 return False
             time.sleep(0.25)
         return True
+
+    def _recover_positions(self):
+        """
+        Adopt anything a previous run of today was managing.
+
+        Without this, a crash, a reboot or the operator pressing Stop leaves
+        live positions with nobody watching them and no 09:30 square-off —
+        the broker's own intraday cut at around 15:20 becomes the only
+        backstop, hours later and at whatever price.
+        """
+        if config.TRADING_MODE != "LIVE":
+            return
+        saved = position_store.load()
+        if not saved:
+            return
+        logger.critical(f"A previous run today recorded {len(saved)} open "
+                        f"position(s). Checking them against the broker...")
+        positions = self.om.fetch_positions()
+        if positions is None:
+            logger.critical("Could not read positions from the broker. CHECK "
+                            "THE TERMINAL MANUALLY before continuing.")
+            return
+
+        for row in saved:
+            sym = (row.get("instrument") or {}).get("symbol") or row.get("symbol")
+            qty = positions.get(sym, 0)
+            if not qty:
+                logger.info(f"{row['name']}: recorded as open but the broker "
+                            f"shows flat — already closed, nothing to do.")
+                continue
+            st = S.StockState(
+                name=row["name"], symbol=row["symbol"], token=row["token"],
+                side=row["side"], rank=0,
+                tick_size=row.get("tick_size") or 0.05, lot_size=0,
+                auction_price=row.get("open_price") or 0.0,
+                prev_close=0.0, gap_pct=0.0)
+            st.open_price = row.get("open_price") or 0.0
+            st.state = S.ENTERED
+            st.qty = abs(int(qty))
+            st.entry_price = row.get("entry_price") or 0.0
+            st.stop_price = row.get("stop_price") or 0.0
+            st.initial_stop = row.get("initial_stop") or st.stop_price
+            st.trail_steps = row.get("trail_steps") or 0
+            st.breakeven_done = bool(row.get("breakeven_done"))
+            st.instrument = row.get("instrument") or {}
+            st.note = "recovered from a previous run"
+            self.states[st.name] = st
+            self.by_token[st.token] = st
+            self.trades_taken += 1
+            logger.critical(f"RECOVERED {st.name}: broker holds {qty:+d}. "
+                            f"Managing it again and re-arming the stop at "
+                            f"{st.stop_price:.2f}. It will be squared off at "
+                            f"09:30 with everything else.")
+            if st.stop_price and st.instrument:
+                self.om.place_stop(st, st.instrument, st.qty, st.stop_price)
+        self._push_status()
 
     def _preflight(self):
         """
@@ -370,10 +424,7 @@ class TradingEngine:
     def _do_entry(self, st):
         if st.state != S.TESTED or self.halted:
             return
-        # Verification is about to need the order book.
-        if config.TRADING_MODE == "LIVE":
-            watcher.set_demand(max(1, sum(1 for x in self.states.values()
-                                          if x.state == S.ENTERED) + 1))
+
         now = datetime.now()
         if now > config.last_entry_dt():
             st.state = S.MISSED
@@ -423,22 +474,36 @@ class TradingEngine:
                     f"(test extreme {st.test_extreme:.2f}, depth {depth:.2f}%), "
                     f"risk Rs {risk:,.0f}{'; ' + note if note else ''}")
 
-        fill = self.om.enter(st, inst, qty, ref)
-        if fill is None:
-            st.state = S.SKIPPED
-            st.note = "entry order failed"
-            return
-
-        st.entry_price = fill
-        st.entry_time = datetime.now()
+        # Record what we are about to trade BEFORE sending it. If the
+        # outcome turns out to be unknown, the reconciler and the 09:30 sweep
+        # still need the symbol to look it up at the broker.
+        st.instrument = inst
         st.qty = qty
         st.stop_price = stop_used
         st.initial_stop = stop_used
         st.risk_amount = risk
-        st.instrument = inst
+
+        fill, outcome = self.om.enter(st, inst, qty, ref)
+        if outcome == "unknown":
+            st.state = S.UNCONFIRMED
+            st.note = "order accepted, fill unconfirmed — resolving"
+            self.trades_taken += 1
+            position_store.save(self.states)
+            self._push_status()
+            return
+        if fill is None:
+            st.state = S.SKIPPED
+            st.note = "entry order failed"
+            st.instrument = {}
+            st.qty = 0
+            return
+
+        st.entry_price = fill
+        st.entry_time = datetime.now()
         st.note = note
         st.state = S.ENTERED
         self.trades_taken += 1
+        position_store.save(self.states)
 
         if inst["kind"] == "STOCK" or inst["kind"] == "FUTURE":
             self.om.place_stop(st, inst, qty, stop_used)
@@ -615,6 +680,7 @@ class TradingEngine:
             st.state = S.CLOSED
             self.om.book_pnl(st)
             self.om.log_trade(st, self.capital)
+            position_store.save(self.states)
             self._push_status()
         finally:
             lock.release()
@@ -633,20 +699,25 @@ class TradingEngine:
         would otherwise leave the app managing a position that no longer
         exists, and leave the trade log wrong for good.
         """
-        interval = int(config.STRATEGY.get("reconcile_seconds", 20))
+        interval = max(3, int(config.STRATEGY.get("reconcile_seconds", 3)))
         while not self._stop.is_set():
             for _ in range(interval):
                 if self._stop.is_set():
                     return
                 time.sleep(1)
+            position_store.save(self.states)
             try:
                 self._reconcile_once()
             except Exception as e:
                 logger.error(f"Reconciler cycle error: {e}")
 
     def _reconcile_once(self):
-        book = self.om.fetch_order_book()
+        # getPosition is the cheap truth check (1/sec, we use 1 per 3s).
+        # The order book is only read when something actually needs it.
         positions = self.om.fetch_positions()
+        need_book = any(st.state in (S.ENTERED, S.UNCONFIRMED)
+                        for st in self.states.values())
+        book = self.om.fetch_order_book() if need_book else {}
 
         for st in list(self.states.values()):
             if not st.instrument:
@@ -693,6 +764,37 @@ class TradingEngine:
                             self._push_status()
                     finally:
                         lock.release()
+                continue
+
+            # ---- (2b) outcome unknown: ask the broker what we actually have ----
+            if st.state == S.UNCONFIRMED:
+                if broker_qty is None:
+                    continue                      # cannot tell yet
+                if broker_qty == 0:
+                    st.state = S.SKIPPED
+                    st.note = "order accepted but never filled (confirmed flat)"
+                    logger.info(f"{st.name}: resolved — the broker shows no "
+                                f"position, so the order did not fill.")
+                    self.trades_taken = max(0, self.trades_taken - 1)
+                    continue
+                want_long = st.is_long
+                if (broker_qty > 0) != want_long:
+                    logger.critical(f"{st.name}: the broker holds "
+                                    f"{broker_qty:+d} — the OPPOSITE side to "
+                                    f"what we sent. CHECK THE TERMINAL.")
+                    continue
+                px = self._reconcile_exit_price(st, book) or st.ltp
+                st.qty = abs(broker_qty)
+                st.entry_price = st.entry_price or px or st.ltp
+                st.entry_time = st.entry_time or datetime.now()
+                st.state = S.ENTERED
+                st.note = "adopted from the broker after an unconfirmed fill"
+                logger.critical(f"{st.name}: ADOPTED — the broker holds "
+                                f"{broker_qty:+d}, so the order DID fill. "
+                                f"Managing it now and placing a stop at "
+                                f"{st.stop_price:.2f}.")
+                self.om.place_stop(st, st.instrument, st.qty, st.stop_price)
+                self._push_status()
                 continue
 
             # ---- (3) app thinks flat, broker holds: an orphan ----
@@ -776,16 +878,14 @@ class TradingEngine:
                     self._close_all("LOSS_CAP")
 
             # ---- resting stops that fired without us ----
-            if config.TRADING_MODE == "LIVE" and time.time() - last_sl_poll > 4:
-                last_sl_poll = time.time()
+            if config.TRADING_MODE == "LIVE":
                 watching = [s for s in self.states.values()
                             if s.state == S.ENTERED and self.om.sl_orders.get(s.name)]
-                if watching:
-                    # One order-book read covers every open position. Polling
-                    # each one separately is what tipped the account over
-                    # Angel's access-rate limit.
-                    book = self.om.fetch_order_book()
-                    for s in watching:
+                due = [s for s in watching if self._status_due(s, now)]
+                if due:
+                    book = None
+                    for s in due:
+                        s._last_status_poll = now
                         filled, px = self.om.stop_filled(s.name, book)
                         if filled:
                             if not getattr(s, "_fill_announced", False):
@@ -835,16 +935,38 @@ class TradingEngine:
                 self._end_of_day()
                 return
 
-            if config.TRADING_MODE == "LIVE":
-                open_now = sum(1 for x in self.states.values()
-                               if x.state == S.ENTERED)
-                watcher.set_demand(open_now)
-
             if time.time() - last_status > 1.0:
                 last_status = time.time()
                 self._push_status()
 
             time.sleep(0.25)
+
+    def _status_due(self, st, now) -> bool:
+        """
+        How often to ask about one resting stop, decided by where price is
+        relative to it.
+
+        A stop sitting far away needs almost no attention; a stop about to be
+        hit needs a lot. Tying the cadence to price means the expensive case
+        is exactly the case that matters, and four quiet positions cost
+        0.4 calls/sec against the 10/sec the per-order endpoint allows.
+        """
+        last = getattr(st, "_last_status_poll", None)
+        stop, ltp = st.stop_price, st.ltp
+        if not stop or not ltp:
+            cadence = 10.0
+        else:
+            through = (ltp <= stop) if st.is_long else (ltp >= stop)
+            gap = abs(ltp - stop) / stop
+            if through:
+                cadence = 0.5          # resolve it now
+            elif gap <= 0.002:
+                cadence = 1.0          # within 0.2% — about to matter
+            else:
+                cadence = 10.0         # far away — barely look
+        if last is None:
+            return True
+        return (now - last).total_seconds() >= cadence
 
     def _close_all(self, reason):
         for s in self.states.values():
@@ -920,9 +1042,7 @@ class TradingEngine:
         for s in self.states.values():
             logger.info(f"  {s.name:<14} {s.side:<7} {s.state:<13} "
                         f"{s.note}")
-        if config.TRADING_MODE == "LIVE":
-            watcher.report(time.monotonic() - getattr(self, "_session_start",
-                                                      time.monotonic()))
+        api_rate_limiter.log_stats()
         logger.info(f"Trade log:  {config.trades_file()}")
         logger.info(f"Order log:  {config.orders_file()}")
         logger.info(f"Watchlist:  {config.scan_file()}")
@@ -933,7 +1053,7 @@ class TradingEngine:
         # polling the order book and the position endpoint indefinitely after
         # the session has finished — long after there is anything to reconcile.
         self._stop.set()
-        watcher.stop()
+        position_store.clear()
         if self.feed:
             self.feed.stop()
 

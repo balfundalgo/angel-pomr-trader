@@ -1,204 +1,195 @@
-# api_rate_limiter.py
 """
-Endpoint-aware API rate limiter for Angel One SmartAPI calls.
+api_rate_limiter.py
+===================
+Enforces Angel One's published throttling limits, per client code.
 
-Why this exists:
-- You need *exact* broker candles (OHLC/VWAP) via getCandleData
-- You also need *fast* order execution
-- A single global limiter makes candle fetches block placeOrder() and adds latency
+Three things in Angel's table shape this design and are easy to miss:
 
-This module provides:
-- Per-endpoint rate buckets (independent locks + timers)
-- A small, safe default delay per endpoint
-- Backwards-compatible api_rate_limiter.wait("some-name") API used in your code
+  * placeOrder, modifyOrder and cancelOrder are counted TOGETHER. Nine
+    requests per second across all three, not nine each. Three separate
+    buckets would let us sit inside every individual limit and still be
+    refused.
 
-Notes:
-- We intentionally keep order endpoints in a separate bucket so they don't wait
-  behind candle refresh calls.
+  * Several endpoints have a per-MINUTE cap that binds long before the
+    per-second one. details/{id} allows 10/sec but only 500/min — that is
+    8.3/sec sustained, so the 10/sec figure is a burst allowance, not a rate
+    that can be held.
+
+  * getOrderBook, getPosition and getTradeBook are 1/sec with no minute cap.
+    They are the most restricted endpoints Angel offers, and must not carry
+    anything that needs frequent polling.
+
+Each bucket therefore carries a minimum interval AND rolling per-minute and
+per-hour windows, and wait() blocks until every one of them allows the call.
 """
 
 from __future__ import annotations
-
-import time
 import threading
-from dataclasses import dataclass
-from typing import Dict, Optional
-from datetime import datetime
+import time
+from collections import deque
+from typing import Optional
+
+# ----------------------------------------------------------------------
+# Angel's published table, transcribed. (per_second, per_minute, per_hour)
+# None means not published / not enforced.
+# ----------------------------------------------------------------------
+LIMITS = {
+    "orders":        (9,  500, 1000),   # place + modify + cancel, CUMULATIVE
+    "orderDetails":  (10, 500, 5000),   # /order/v1/details/{GuiOrderID}
+    "orderBook":     (1,  None, None),
+    "position":      (1,  None, None),
+    "tradeBook":     (1,  None, None),
+    "ltpData":       (10, 500, 5000),
+    "quote":         (10, 500, 5000),
+    "rmsLimit":      (2,  None, None),
+    "getProfile":    (3,  None, 1000),
+    "candleData":    (3,  120, 5000),
+    "searchScrip":   (1,  None, None),
+    "other":         (2,  None, None),
+}
+
+# We never spend the whole published allowance.
+MARGIN = 0.80
 
 
 def _normalize_key(api_name: str) -> str:
-    """Map arbitrary call labels to a small set of endpoint buckets."""
-    name = (api_name or "").lower()
+    n = (api_name or "").lower().replace("_", "").replace("-", "")
 
-    # Historical candles
-    if "getcandledata" in name or "candle" in name:
-        return "getCandleData"
+    # The cumulative order bucket — these three share one allowance.
+    if any(k in n for k in ("placeorder", "modifyorder", "cancelorder")):
+        return "orders"
+    if n in ("place", "modify", "cancel", "orders"):
+        return "orders"
 
-    # Orders
-    if "placeorder" in name or "place_" in name and "order" in name:
-        return "placeOrder"
-    if "modify" in name and "order" in name:
-        return "modifyOrder"
-    if "cancel" in name and "order" in name:
-        return "cancelOrder"
+    # Per-order status. Checked BEFORE orderbook so it cannot fall through
+    # into the 1/sec bucket.
+    if "details" in n or "orderstatus" in n or "individual" in n:
+        return "orderDetails"
 
-    # Books / positions
-    if "orderbook" in name:
+    if "orderbook" in n:
         return "orderBook"
-    if "tradebook" in name:
+    if "tradebook" in n:
         return "tradeBook"
-    if "position" in name:
+    if "position" in n:
         return "position"
-
-    # Bulk quote snapshot (pre-open scan) — Angel allows ~1 req/sec
-    if "marketdata" in name or "getmarketdata" in name or "quote" in name:
-        return "getMarketData"
-
-    # Funds / RMS
-    if "rms" in name or "fund" in name or "margin" in name:
-        return "rmsLimit"
-
-    # LTP
-    if "ltp" in name:
+    if "ltp" in n:
         return "ltpData"
-
-    # Fallback
+    if "marketdata" in n or "quote" in n:
+        return "quote"
+    if "rms" in n or "fund" in n or "margin" in n:
+        return "rmsLimit"
+    if "profile" in n:
+        return "getProfile"
+    if "candle" in n or "historical" in n:
+        return "candleData"
+    if "searchscrip" in n:
+        return "searchScrip"
     return "other"
 
 
-@dataclass
 class _Bucket:
-    min_interval: float
-    lock: threading.Lock
-    last_call_ts: float = 0.0
-    total_calls: int = 0
-    total_wait_s: float = 0.0
+    def __init__(self, name, per_second, per_minute, per_hour):
+        self.name = name
+        self.per_second = per_second
+        self.per_minute = per_minute
+        self.per_hour = per_hour
+        self.min_interval = (1.0 / (per_second * MARGIN)) if per_second else 0.0
+        self._base_interval = self.min_interval
+        self._last = 0.0
+        self._minute = deque()
+        self._hour = deque()
+        self.calls = 0
+        self.waited = 0.0
+
+    @staticmethod
+    def _cap(limit):
+        return int(limit * MARGIN) if limit else None
+
+    def delay_needed(self, now: float) -> float:
+        wait = max(0.0, (self._last + self.min_interval) - now)
+
+        m = self._cap(self.per_minute)
+        if m:
+            while self._minute and now - self._minute[0] > 60:
+                self._minute.popleft()
+            if len(self._minute) >= m:
+                wait = max(wait, 60 - (now - self._minute[0]) + 0.01)
+
+        h = self._cap(self.per_hour)
+        if h:
+            while self._hour and now - self._hour[0] > 3600:
+                self._hour.popleft()
+            if len(self._hour) >= h:
+                wait = max(wait, 3600 - (now - self._hour[0]) + 0.01)
+        return wait
+
+    def record(self, now: float):
+        self._last = now
+        self.calls += 1
+        if self.per_minute:
+            self._minute.append(now)
+        if self.per_hour:
+            self._hour.append(now)
 
 
-class EndpointRateLimiter:
-    """
-    Thread-safe per-endpoint rate limiter.
-
-    Usage:
-        from api_rate_limiter import api_rate_limiter
-        api_rate_limiter.wait("getCandleData")
-        resp = conn.getCandleData(params)
-    """
-
-    def __init__(self, bucket_intervals: Optional[Dict[str, float]] = None):
-        # Conservative but not slow. Tune if broker returns rate-limit errors.
-        defaults = {
-            # Candles: Angel enforces a per-second limit AND a 180/min cap
-            # shared across the whole client code. Stay well under it.
-            "getCandleData": 0.8,    # ~1.25 calls/sec
-            # Bulk quotes: Angel documents 1 request/second on getMarketData.
-            # The pre-open scan fires ~5 of these back to back, so keep a
-            # full second of headroom or the whole watchlist is lost.
-            "getMarketData": 1.05,
-            # Funds / RMS
-            "rmsLimit": 1.05,
-            # LTP: keep fast
-            "ltpData": 0.12,         # ~8 calls/sec
-            # Books / positions are typically stricter
-            # Angel refuses well before a strict 1/sec in practice, and the
-            # order book is polled continuously while positions are open.
-            "orderBook": 1.60,
-            # Angel's individual-order-status endpoint allows 10/sec; keep a
-            # comfortable margin rather than using the whole allowance.
-            "orderStatus": 0.25,
-            "tradeBook": 1.05,
-            "position": 1.05,
-            # Orders: keep separate and fast
-            "placeOrder": 0.15,
-            "modifyOrder": 0.25,
-            "cancelOrder": 0.25,
-            # Misc
-            "other": 0.20,
-        }
-        if bucket_intervals:
-            defaults.update(bucket_intervals)
-
-        self._buckets: Dict[str, _Bucket] = {
-            k: _Bucket(min_interval=v, lock=threading.Lock())
-            for k, v in defaults.items()
-        }
+class ApiRateLimiter:
+    def __init__(self, bucket_intervals: Optional[dict] = None):
+        self._lock = threading.Lock()
+        self._buckets = {name: _Bucket(name, *limits)
+                         for name, limits in LIMITS.items()}
+        for name, interval in (bucket_intervals or {}).items():
+            b = self._buckets.get(_normalize_key(name))
+            if b:
+                b.min_interval = float(interval)
+                b._base_interval = float(interval)
 
     def wait(self, api_name: str = "other") -> None:
-        """Wait if needed for this endpoint bucket."""
         key = _normalize_key(api_name)
         bucket = self._buckets.get(key) or self._buckets["other"]
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                delay = bucket.delay_needed(now)
+                if delay <= 0:
+                    bucket.record(now)
+                    return
+            bucket.waited += delay
+            time.sleep(min(delay, 1.0))
 
-        with bucket.lock:
-            now = time.perf_counter()
-            elapsed = now - bucket.last_call_ts
-            wait_s = bucket.min_interval - elapsed
-            if wait_s > 0:
-                time.sleep(wait_s)
-                bucket.total_wait_s += wait_s
-                now = time.perf_counter()
-
-            bucket.last_call_ts = now
-            bucket.total_calls += 1
-
-    def log_stats(self) -> None:
-        """Print a small snapshot of limiter usage (safe to call occasionally)."""
-        lines = []
-        for k, b in self._buckets.items():
-            avg_wait = (b.total_wait_s / b.total_calls) if b.total_calls else 0.0
-            lines.append(
-                f"{k:12s} calls={b.total_calls:6d} total_wait={b.total_wait_s:7.2f}s avg_wait={avg_wait:.4f}s"
-            )
-        print("=== API Rate Limiter Stats ===")
-        print("\n".join(lines))
-        print("==============================")
-
-    # Backwards compatibility with earlier code expecting attribute
-    @property
-    def min_delay(self) -> float:
-        # Old global value; return a representative slow endpoint delay
-        return float(self._buckets["orderBook"].min_interval)
-
+    def allows_now(self, api_name: str = "other") -> bool:
+        """Non-blocking check, for callers that would rather skip than queue."""
+        key = _normalize_key(api_name)
+        bucket = self._buckets.get(key) or self._buckets["other"]
+        with self._lock:
+            return bucket.delay_needed(time.monotonic()) <= 0
 
     def penalise(self, key: str, seconds: float = 2.0):
-        """Temporarily slow a bucket after the broker has refused us for rate.
-        Decays back to the configured interval on the next clean call."""
-        try:
-            bucket = self._buckets.get(self._normalise(key)) \
-                if hasattr(self, "_normalise") else None
-        except Exception:
-            bucket = None
-        if bucket is None:
-            bucket = self._buckets.get(key)
+        bucket = self._buckets.get(_normalize_key(key))
         if bucket is None:
             return
-        base = getattr(bucket, "_base_interval", None)
-        if base is None:
-            bucket._base_interval = bucket.min_interval
-            base = bucket.min_interval
-        bucket.min_interval = min(base * 8, bucket.min_interval + seconds)
+        bucket.min_interval = min(bucket._base_interval * 8,
+                                  bucket.min_interval + seconds)
 
     def relax(self, key: str):
-        bucket = self._buckets.get(key)
-        if bucket is not None and getattr(bucket, "_base_interval", None):
+        bucket = self._buckets.get(_normalize_key(key))
+        if bucket is not None:
             bucket.min_interval = bucket._base_interval
 
+    def min_delay(self) -> float:
+        return float(self._buckets["orderBook"].min_interval)
+
+    def report(self) -> str:
+        parts = [f"{n}={b.calls}" for n, b in sorted(self._buckets.items())
+                 if b.calls]
+        return ", ".join(parts) or "no API calls"
+
+    def log_stats(self) -> None:
+        from logger import logger
+        logger.info(f"API calls this session: {self.report()}")
 
 
-# Shared instance used by all modules
-api_rate_limiter = EndpointRateLimiter()
+api_rate_limiter = ApiRateLimiter()
 
 
-# Backwards-compatible helper
 def wait(api_name: str = "other") -> None:
     api_rate_limiter.wait(api_name)
-
-
-if __name__ == "__main__":
-    print("Testing endpoint-aware API rate limiter...")
-    for i in range(3):
-        api_rate_limiter.wait("getCandleData")
-        print("candle", i, datetime.now().strftime("%H:%M:%S.%f")[:-3])
-    for i in range(3):
-        api_rate_limiter.wait("placeOrder")
-        print("order ", i, datetime.now().strftime("%H:%M:%S.%f")[:-3])
-    api_rate_limiter.log_stats()

@@ -32,7 +32,6 @@ import config
 from logger import logger
 from api_rate_limiter import api_rate_limiter
 from angel_data import round_to_tick
-from order_book import watcher
 import cautionary
 
 _ORDER_COLS = ["time", "mode", "name", "instrument", "symbol", "side",
@@ -131,29 +130,55 @@ class OrderManager:
     # ------------------------------------------------------------------
     # entry
     # ------------------------------------------------------------------
-    def enter(self, st, inst: dict, qty: int, ref_price: float) -> float | None:
-        """Market entry. Buy the gainer, sell the loser short."""
+    def enter(self, st, inst: dict, qty: int, ref_price: float):
+        """
+        Market entry. Returns (fill_price, outcome) where outcome is
+        "filled", "failed" or "unknown".
+
+        "unknown" means the broker ACCEPTED the order and gave us an id, but
+        we could not confirm what became of it. That is not a failure. The
+        order is very likely live, and treating it as failed abandons a real
+        position.
+        """
         side = "BUY" if st.is_long else "SELL"
         if config.TRADING_MODE == "PAPER":
             px = self._paper_fill(ref_price, side)
             self._log_order(st.name, inst, side, qty, px, "MARKET",
                             status="PAPER_FILL")
             logger.info(f"[PAPER] {side} {qty} {inst['symbol']} @ {px:.2f}")
-            return px
+            return px, "filled"
 
-        oid = self._send(self._market_params(inst, qty, side),
-                         f"ENTRY {side} {qty} {inst['symbol']}", st.name)
-        self._log_order(st.name, inst, side, qty, ref_price, "MARKET",
-                        order_id=oid or "", status="SUBMITTED")
-        ok, fill, detail = self._verify(oid, f"ENTRY {side} {inst['symbol']}")
-        self._log_order(st.name, inst, side, qty, fill or ref_price, "MARKET",
-                        order_id=oid or "",
-                        status="COMPLETE" if ok else "FAILED", detail=detail)
-        if not ok:
-            logger.critical(f"ENTRY FAILED for {st.name} — no position taken. "
-                            f"{detail}")
-            return None
-        return fill or ref_price
+        if True:  # single submission path
+            oid = self._send(self._market_params(inst, qty, side),
+                             f"ENTRY {side} {qty} {inst['symbol']}", st.name)
+            self._log_order(st.name, inst, side, qty, ref_price, "MARKET",
+                            order_id=oid or "", status="SUBMITTED")
+            if not oid:
+                logger.critical(f"ENTRY FAILED for {st.name} — the broker did "
+                                f"not accept the order. No position taken.")
+                return None, "failed"
+            ok, fill, detail = self._verify(oid, f"ENTRY {side} {inst['symbol']}")
+
+        if ok:
+            self._log_order(st.name, inst, side, qty, fill or ref_price,
+                            "MARKET", order_id=oid, status="COMPLETE",
+                            detail=detail)
+            return fill or ref_price, "filled"
+
+        if "unknown" in detail or "unavailable" in detail or "timeout" in detail:
+            self._log_order(st.name, inst, side, qty, ref_price, "MARKET",
+                            order_id=oid, status="UNCONFIRMED", detail=detail)
+            logger.critical(
+                f"{st.name}: the broker ACCEPTED order {oid} but we could not "
+                f"confirm the fill ({detail}). Treating the position as "
+                f"POSSIBLY OPEN — it will be resolved against the broker's "
+                f"own position book. DO NOT assume nothing happened.")
+            return None, "unknown"
+
+        self._log_order(st.name, inst, side, qty, 0.0, "MARKET",
+                        order_id=oid, status="FAILED", detail=detail)
+        logger.critical(f"ENTRY FAILED for {st.name} — {detail}")
+        return None, "failed"
 
     # ------------------------------------------------------------------
     # protective stop
@@ -378,14 +403,29 @@ class OrderManager:
         oid = self.sl_orders.pop(name, None)
         if not oid or config.TRADING_MODE != "LIVE":
             return "none", 0.0
-        marker = watcher.marker()
         try:
             api_rate_limiter.wait("cancelOrder")
             config.SMART.cancelOrder(oid, "STOPLOSS")
         except Exception as e:
             logger.error(f"{name}: cancel stop {oid} raised: {e}")
 
-        book = watcher.fresh_after(marker, timeout=6.0)
+        book = None
+        for _ in range(8):
+            direct = self.status_direct(oid)
+            if direct is not None:
+                st_, px_, _ = direct
+                if st_ in ("complete", "filled"):
+                    logger.warning(f"{name}: the resting stop had ALREADY "
+                                   f"FILLED at {px_:.2f} — it could not be "
+                                   f"cancelled. No exit order will be sent.")
+                    return "filled", px_
+                if st_ in ("cancelled", "rejected"):
+                    logger.info(f"{name}: resting stop {oid} cancelled.")
+                    return "cancelled", 0.0
+            else:
+                book = self.fetch_order_book()
+                break
+            time.sleep(0.3)
         if book is None:
             logger.critical(f"{name}: could not confirm what happened to stop "
                             f"{oid} — the order book is unavailable. Treating "
@@ -520,8 +560,6 @@ class OrderManager:
         for attempt in range(config.RETRY["max_retries"]):
             try:
                 api_rate_limiter.wait("placeOrder")
-                # Evidence must post-date the action, so mark the clock first.
-                self._last_marker = watcher.marker()
                 oid, detail = self._submit(params)
                 if oid and len(str(oid)) > 4:
                     pend = getattr(OrderManager, "_pending_unique", None)
@@ -614,19 +652,27 @@ class OrderManager:
 
     def fetch_order_book(self, force: bool = False) -> dict:
         """
-        The shared snapshot. This makes NO API call of its own — the watcher
-        thread is the only reader, so the cost of the order book is one fixed
-        rate for the whole app rather than something that grows with the
-        number of orders in flight.
+        One direct read of the order book.
+
+        This endpoint is 1 request/second with no minute allowance — the most
+        restricted in Angel's table — so it is used only by the reconciler
+        and as a fallback. Anything that needs to be watched closely goes
+        through details/{id} instead, which allows ten times the rate.
         """
-        book, age, ok = watcher.current()
-        if not ok and age > 15:
-            last = getattr(self, "_stale_warned_at", 0.0)
+        try:
+            api_rate_limiter.wait("orderBook")
+            resp = config.SMART.orderBook()
+            return {str(r.get("orderid")): r
+                    for r in (resp or {}).get("data", []) or []}
+        except Exception as e:
+            msg = str(e)
+            if "access rate" in msg.lower() or "exceeding" in msg.lower():
+                api_rate_limiter.penalise("orderBook", 1.0)
+            last = getattr(self, "_book_warned_at", 0.0)
             if time.time() - last > 60:
-                self._stale_warned_at = time.time()
-                logger.warning(f"Order book snapshot is {age:.0f}s old — "
-                               f"treating its contents as unconfirmed.")
-        return book
+                self._book_warned_at = time.time()
+                logger.warning(f"Order book read failed: {msg[:120]}")
+            return {}
 
     def square_off_stray(self, symbol: str, token: str, exchange: str,
                          netqty: int) -> bool:
@@ -694,13 +740,20 @@ class OrderManager:
         is covered.
         """
         readable = False
-        marker = getattr(self, "_last_marker", None) or watcher.marker()
         for _ in range(tries):
-            book = watcher.fresh_after(marker, timeout=5.0)
-            if book is None:
-                break
-            marker = time.monotonic()
-            readable = True
+            direct = self.status_direct(oid)
+            if direct is not None:
+                readable = True
+                st_, _px, _fq = direct
+                if st_ in ("cancelled", "rejected"):
+                    return "gone"
+                if st_ in ("complete", "filled"):
+                    return "filled"
+                if st_ in ("trigger pending", "open", "pending"):
+                    return "resting"
+            book = self.fetch_order_book()
+            if book:
+                readable = True
             row = book.get(str(oid))
             if row:
                 status = str(row.get("status", "")).lower()
@@ -821,24 +874,39 @@ class OrderManager:
         """
         if not order_id:
             return False, 0.0, "no order id returned"
-        marker = getattr(self, "_last_marker", None) or watcher.marker()
-        deadline = time.monotonic() + 10.0
+        # details/{id} allows 10/sec against getOrderBook's 1/sec, so a fill
+        # is normally confirmed inside a second instead of waiting on a
+        # shared snapshot.
+        deadline = time.monotonic() + 6.0
+        seen_any = False
         while time.monotonic() < deadline:
-            book = watcher.fresh_after(marker, timeout=deadline - time.monotonic())
-            if book is None:
-                # No snapshot newer than the order was published in time. We
-                # do not know the outcome — say so rather than guessing.
-                return False, 0.0, "order book unavailable; outcome unknown"
-            marker = time.monotonic()
-            status, px, text = self._order_status(order_id, book)
-            if status in ("complete", "filled"):
-                logger.info(f"FILL CONFIRMED [{label}] id={order_id} @ {px:.2f}")
-                return True, px, "complete"
-            if status in ("rejected", "cancelled"):
-                logger.critical(f"ORDER {status.upper()} [{label}] "
-                                f"id={order_id} reason: {text}")
-                return False, 0.0, f"{status}: {text}"
-        return False, 0.0, "not confirmed within timeout"
+            direct = self.status_direct(order_id)
+            if direct is not None:
+                seen_any = True
+                status, px, fq = direct
+                if status in ("complete", "filled"):
+                    logger.info(f"FILL CONFIRMED [{label}] id={order_id} "
+                                f"@ {px:.2f}")
+                    return True, px, "complete"
+                if status in ("rejected", "cancelled"):
+                    logger.critical(f"ORDER {status.upper()} [{label}] "
+                                    f"id={order_id}")
+                    return False, 0.0, f"{status}"
+            else:
+                # No per-order endpoint available — fall back to the book once.
+                status, px, text = self._order_status(order_id,
+                                                      self.fetch_order_book())
+                if status is not None:
+                    seen_any = True
+                    if status in ("complete", "filled"):
+                        logger.info(f"FILL CONFIRMED [{label}] id={order_id} "
+                                    f"@ {px:.2f}")
+                        return True, px, "complete"
+                    if status in ("rejected", "cancelled"):
+                        return False, 0.0, f"{status}: {text}"
+            time.sleep(0.3)
+        return False, 0.0, ("not confirmed within timeout" if seen_any
+                            else "order status unavailable; outcome unknown")
 
     def summary(self):
         return {"realized": round(self.realized, 2),

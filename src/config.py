@@ -111,11 +111,8 @@ STRATEGY = {
     # not understand is how a mistake gets doubled.
     "auto_fix_stray": True,
     # How often the reconciler asks the broker what is actually open.
-    "reconcile_seconds": 20,
-    # Seconds between order-book reads. ONE thread does all of them, so this
-    # is the app's entire order-book call rate regardless of how many orders
-    # are in flight. Angel allows roughly 1/sec; 1.5 leaves real headroom.
-    "orderbook_interval": 1.5,
+    "reconcile_seconds": 3,
+
     "paper_slippage_pct": 0.05,       # each side, PAPER mode only
 }
 
